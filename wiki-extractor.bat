@@ -4,7 +4,6 @@ setlocal
 rem Use the known working Edge invocation pattern
 rem (quotes are part of EDGE so we call %EDGE% directly)
 set EDGE="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-set PROFILE=C:\Users\G1HDMGS\AppData\Local\Microsoft\Edge\User Data
 set BASEURL=https://ams-wiki.in.audi.vwg/wiki/bin/view/PPService
 set TOPICS="C:\Users\G1HDMGS\Documents\topics.txt"
 set OUTPUT=C:\Users\G1HDMGS\Documents\wiki_output
@@ -49,11 +48,32 @@ set "SIZE="
 
 :download
 echo Exporting %TOPIC% ...
-%EDGE% --headless --disable-gpu ^
-    --user-data-dir="%PROFILE%" ^
+rem Start Edge asynchronously so a stuck login page cannot block the batch
+start "" %EDGE% --headless --disable-gpu ^
     --print-to-pdf="%PDFFILE%" ^
     "%BASEURL%/%TOPIC%?skin=print"
 
-rem Optional: small delay between requests
+rem Wait up to MAXWAIT seconds for a non-zero PDF, then move on
+set "MAXWAIT=40"
+set "WAITED=0"
+
+:waitloop
+if %WAITED% GEQ %MAXWAIT% goto logfailed
+
+if exist "%PDFFILE%" (
+    for %%A in ("%PDFFILE%") do set "SIZE=%%~zA"
+    if not "%SIZE%"=="0" (
+        set "SIZE="
+        goto :EOF
+    )
+)
+
 timeout /t 2 /nobreak >nul
+set /a WAITED+=2
+goto waitloop
+
+:logfailed
+echo FAILED to generate PDF for %TOPIC% (login or other issue) >> "%OUTPUT%\wiki_failed.log"
+echo WARNING: PDF not created for %TOPIC% - logged to wiki_failed.log
+set "SIZE="
 goto :EOF
