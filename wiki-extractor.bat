@@ -4,6 +4,7 @@ setlocal
 rem Use the known working Edge invocation pattern
 rem (quotes are part of EDGE so we call %EDGE% directly)
 set EDGE="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+set PROFILE=C:\Users\G1HDMGS\AppData\Local\Microsoft\Edge\User Data
 set BASEURL=https://ams-wiki.in.audi.vwg/wiki/bin/view/PPService
 set TOPICS="C:\Users\G1HDMGS\Documents\topics.txt"
 set OUTPUT=C:\Users\G1HDMGS\Documents\wiki_output
@@ -49,6 +50,7 @@ set "SIZE="
 :download
 echo Exporting %TOPIC% ...
 %EDGE% --headless --disable-gpu ^
+    --user-data-dir="%PROFILE%" ^
     --print-to-pdf="%PDFFILE%" ^
     "%BASEURL%/%TOPIC%?skin=print"
 
