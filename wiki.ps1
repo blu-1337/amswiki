@@ -205,11 +205,17 @@ foreach ($topic in $topics) {
             $topicUrl
         )
 
-        & $curlExe @curlArgs 2>$null
+        $curlOutput = & $curlExe @curlArgs 2>&1
         $exitCode = $LASTEXITCODE
 
         if ($exitCode -ne 0) {
-            $lastError = ("curl exit code {0} (url: {1})" -f $exitCode, $topicUrl)
+            $curlMessage = ([string]::Join(" ", $curlOutput)).Trim()
+            if ([string]::IsNullOrWhiteSpace($curlMessage)) {
+                $lastError = ("curl exit code {0} (url: {1})" -f $exitCode, $topicUrl)
+            }
+            else {
+                $lastError = ("curl exit code {0}: {1} (url: {2})" -f $exitCode, $curlMessage, $topicUrl)
+            }
         }
         elseif (-not (Test-Path -LiteralPath $tmpPath)) {
             $lastError = "Download finished but file was not created."
