@@ -3,6 +3,7 @@
 param(
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
     [string]$TopicsFile = "topics.txt",       # Each line: TopicName OR Web/TopicName
+    [string]$Topic = "",                      # Optional single topic for quick testing
     [string]$OutputDir = "wiki_output",
     [string]$DefaultWeb = "PPService",        # Applied when line has only topic name
     [string]$QueryString = "",                # Example: "skin=genpdf,pattern"
@@ -324,9 +325,14 @@ $script:CurlExe = if ($null -ne $curlCommand) { $curlCommand.Source } else { $nu
 $downloadMethod = if ($null -ne $script:CurlExe) { "curl.exe --negotiate" } else { "Invoke-WebRequest (fallback)" }
 
 $failedLog = Join-Path -Path $OutputDir -ChildPath "wiki_failed.log"
-$topics = Get-Content -LiteralPath $TopicsFile |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+if (-not [string]::IsNullOrWhiteSpace($Topic)) {
+    $topics = @($Topic.Trim())
+}
+else {
+    $topics = Get-Content -LiteralPath $TopicsFile |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+}
 
 if ($topics.Count -eq 0) {
     Write-Warning "No topics found in $TopicsFile"
