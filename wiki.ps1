@@ -10,6 +10,7 @@ param(
     [string[]]$FallbackWebs = @("System"),
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
     [string]$TopicsFile = "topics.txt",
+    [string]$SingleTopic = "",
     [string]$OutputDir = "wiki_output",
     [string]$QueryString = "skin=;",
     [int]$RetryCount = 2,
@@ -210,9 +211,14 @@ if (-not (Test-Path -LiteralPath $outputPath)) {
 }
 Remove-IfExists -Path $cookieJar
 
-$topics = Get-Content -LiteralPath $topicsPath |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+if (-not [string]::IsNullOrWhiteSpace($SingleTopic)) {
+    $topics = @($SingleTopic.Trim())
+}
+else {
+    $topics = Get-Content -LiteralPath $topicsPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+}
 
 if ($topics.Count -eq 0) {
     Write-Warning ("No topics found in {0}" -f $topicsPath)
@@ -239,6 +245,9 @@ Write-Host ("Topics file: {0}" -f $topicsPath)
 Write-Host ("Output dir : {0}" -f $outputPath)
 Write-Host ("wget.exe   : {0}" -f $wgetExe)
 Write-Host ("Cookie jar : {0}" -f $cookieJar)
+if (-not [string]::IsNullOrWhiteSpace($SingleTopic)) {
+    Write-Host ("SingleTopic: {0}" -f $SingleTopic)
+}
 if ($AskPasswordPerDownload) {
     Write-Host "Auth mode  : wget --ask-password for each download"
 }
