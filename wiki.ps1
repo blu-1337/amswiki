@@ -1,11 +1,11 @@
 # ==============================================
 # wiki.ps1 - Bulk export Foswiki topics to PDF
-# Works with PowerShell 5+ and 7+, using curl NTLM auth
+# Uses GNU wget authentication flow on Windows
 # ==============================================
 
 [CmdletBinding()]
 param(
-    [string]$Username = $env:USERNAME,                        # Example: g1hdmgs or DOMAIN\g1hdmgs
+    [string]$Username = $env:USERNAME,                     # Example: g1hdmgs or DOMAIN\g1hdmgs
     [string]$BaseWeb = "System",
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
     [string]$TopicsFile = "topics.txt",
@@ -13,7 +13,8 @@ param(
     [string]$QueryString = "skin=;",
     [int]$RetryCount = 2,
     [switch]$Overwrite,
-    [switch]$SkipPlaceholderCheck
+    [switch]$SkipPlaceholderCheck,
+    [switch]$AskPasswordPerDownload
 )
 
 Set-StrictMode -Version Latest
@@ -30,6 +31,18 @@ function Resolve-AbsolutePath {
     }
 
     return [System.IO.Path]::GetFullPath((Join-Path -Path $BasePath -ChildPath $Path))
+}
+
+function Convert-SecureStringToPlainText {
+    param([Parameter(Mandatory = $true)][Security.SecureString]$SecureString)
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
 }
 
 function Remove-IfExists {
@@ -59,8 +72,7 @@ function Test-PdfSignature {
         return $false
     }
 
-    $header = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 5)
-    return ($header -eq "%PDF-")
+    return ([System.Text.Encoding]::ASCII.GetString($bytes, 0, 5) -eq "%PDF-")
 }
 
 function Test-IsGuestPlaceholderPdf {
@@ -95,6 +107,7 @@ function Test-IsGuestPlaceholderPdf {
         "RENDERZONE{",
         "This topic:"
     )
+
     $hitCount = @($markers | Where-Object { $content -like ("*" + $_ + "*") }).Count
     return ($hitCount -ge 2)
 }
@@ -106,7 +119,7 @@ function Split-TopicEntry {
     )
 
     $clean = $Entry.Trim().Trim("/")
-    if (-not $clean) {
+    if ([string]::IsNullOrWhiteSpace($clean)) {
         return $null
     }
 
@@ -125,7 +138,7 @@ function Split-TopicEntry {
     }
 
     return [pscustomobject]@{
-        WebPath   = $webPath
+        WebPath = $webPath
         TopicName = $topicName
     }
 }
@@ -146,11 +159,14 @@ if ([string]::IsNullOrWhiteSpace($Username)) {
     throw "Username is empty. Pass -Username explicitly (example: -Username g1hdmgs)."
 }
 
-$curlCmd = Get-Command curl.exe -ErrorAction SilentlyContinue
-if ($null -eq $curlCmd) {
-    throw "curl.exe was not found. Install curl or run on Windows with curl available."
+$wgetCmd = Get-Command wget.exe -ErrorAction SilentlyContinue
+if ($null -eq $wgetCmd) {
+    $wgetCmd = Get-Command wget -CommandType Application -ErrorAction SilentlyContinue
 }
-$curlExe = $curlCmd.Source
+if ($null -eq $wgetCmd) {
+    throw "GNU wget executable was not found. Ensure wget.exe is installed and on PATH."
+}
+$wgetExe = $wgetCmd.Source
 
 if (-not (Test-Path -LiteralPath $topicsPath)) {
     throw ("Topics file not found: {0}" -f $topicsPath)
@@ -169,12 +185,27 @@ if ($topics.Count -eq 0) {
     exit 0
 }
 
-Write-Host "Starting bulk PDF export using NTLM authentication..."
+$password = $null
+if (-not $AskPasswordPerDownload) {
+    $securePassword = Read-Host ("Password for {0}" -f $Username) -AsSecureString
+    $password = Convert-SecureStringToPlainText -SecureString $securePassword
+    if ([string]::IsNullOrWhiteSpace($password)) {
+        throw "Empty password entered."
+    }
+}
+
+Write-Host "Starting bulk PDF export using GNU wget..."
 Write-Host ("Username   : {0}" -f $Username)
 Write-Host ("Base URL   : {0}" -f $base)
 Write-Host ("Base Web   : {0}" -f $BaseWeb)
 Write-Host ("Topics file: {0}" -f $topicsPath)
 Write-Host ("Output dir : {0}" -f $outputPath)
+if ($AskPasswordPerDownload) {
+    Write-Host "Auth mode  : wget --ask-password for each download"
+}
+else {
+    Write-Host "Auth mode  : single prompt, reused for all downloads"
+}
 Write-Host ""
 
 $ok = 0
@@ -214,29 +245,34 @@ foreach ($entry in $topics) {
         Write-Host ("Downloading {0} ..." -f $entry)
         Remove-IfExists -Path $tmpPath
 
-        # Intentionally mirrors your proven working command:
-        # curl --ntlm -u <username> "<url>" -o <file>
-        $curlArgs = @(
-            "--ntlm",
-            "-u", $Username,
-            "--location",
-            "--silent",
-            "--show-error",
-            "--fail",
-            $topicUrl,
-            "-o", $tmpPath
+        $wgetArgs = @(
+            "--user=$Username",
+            "--content-disposition",
+            "--trust-server-names",
+            "--max-redirect=10",
+            "--server-response",
+            "--output-document=$tmpPath"
         )
 
-        $curlOutput = & $curlExe @curlArgs 2>&1
+        if ($AskPasswordPerDownload) {
+            $wgetArgs += "--ask-password"
+        }
+        else {
+            $wgetArgs += "--password=$password"
+        }
+
+        $wgetArgs += $topicUrl
+
+        $wgetOutput = & $wgetExe @wgetArgs 2>&1
         $exitCode = $LASTEXITCODE
 
         if ($exitCode -ne 0) {
-            $curlMessage = ([string]::Join(" ", $curlOutput)).Trim()
-            if ([string]::IsNullOrWhiteSpace($curlMessage)) {
-                $lastError = ("curl exit code {0}" -f $exitCode)
+            $wgetMessage = ([string]::Join(" ", $wgetOutput)).Trim()
+            if ([string]::IsNullOrWhiteSpace($wgetMessage)) {
+                $lastError = ("wget exit code {0}" -f $exitCode)
             }
             else {
-                $lastError = ("curl exit code {0}: {1}" -f $exitCode, $curlMessage)
+                $lastError = ("wget exit code {0}: {1}" -f $exitCode, $wgetMessage)
             }
         }
         elseif (-not (Test-Path -LiteralPath $tmpPath)) {
@@ -272,6 +308,8 @@ foreach ($entry in $topics) {
         $failed++
     }
 }
+
+$password = $null
 
 Write-Host ""
 Write-Host "Done."
