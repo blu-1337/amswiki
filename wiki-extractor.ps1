@@ -94,17 +94,23 @@ foreach ($topic in $topics) {
 
     if ((-not $Overwrite) -and (Test-Path -LiteralPath $outFile)) {
         $existingSize = (Get-Item -LiteralPath $outFile).Length
-        if ($existingSize -gt 0) {
+        if (($existingSize -gt 0) -and (Test-IsPdfFile -Path $outFile)) {
             Write-Host "Skipping $topic (already downloaded)"
             $skipped++
             continue
         }
 
+        Write-Warning "Existing file for $topic is invalid or empty. Re-downloading..."
         Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
     }
 
     $urlPath = Convert-TopicToUrlPath -Topic $topic
-    $uri = "$base/$urlPath?$QueryString"
+    if ([string]::IsNullOrWhiteSpace($QueryString)) {
+        $uri = "$base/$($urlPath)"
+    }
+    else {
+        $uri = "$base/$($urlPath)?$($QueryString.TrimStart('?'))"
+    }
 
     Write-Host "Downloading $topic ..."
 
