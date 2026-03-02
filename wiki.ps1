@@ -6,8 +6,8 @@
 [CmdletBinding()]
 param(
     [string]$Username = $env:USERNAME,                     # Example: g1hdmgs or DOMAIN\g1hdmgs
-    [string]$BaseWeb = "System",
-    [string[]]$FallbackWebs = @("PPService"),
+    [string]$BaseWeb = "PPService",
+    [string[]]$FallbackWebs = @("System"),
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
     [string]$TopicsFile = "topics.txt",
     [string]$OutputDir = "wiki_output",
@@ -266,7 +266,6 @@ foreach ($entry in $topics) {
 
     $safeFileName = ($entry -replace "[\\/:*?`"<>|]", "_")
     $pdfPath = Join-Path -Path $outputPath -ChildPath ($safeFileName + ".pdf")
-    $tmpPath = $pdfPath + ".download"
 
     if ((-not $Overwrite) -and (Test-Path -LiteralPath $pdfPath)) {
         $size = (Get-Item -LiteralPath $pdfPath).Length
@@ -281,17 +280,19 @@ foreach ($entry in $topics) {
 
     $downloaded = $false
     $allErrors = New-Object System.Collections.Generic.List[string]
+    $candidateResults = New-Object System.Collections.Generic.List[object]
     $encodedTopic = [System.Uri]::EscapeDataString($parsed.TopicName)
 
     foreach ($webCandidate in $webCandidates) {
-        if ($downloaded) { break }
         $encodedWeb = Encode-WebPath -WebPath $webCandidate
         $topicUrl = "{0}/{1}/{2}{3}" -f $base, $encodedWeb, $encodedTopic, $query
         $candidateError = ""
+        $candidateSuccess = $false
+        $candidateTmpPath = "{0}.{1}.download" -f $pdfPath, ($webCandidate -replace "[\\/:*?`"<>|]", "_")
 
-        for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $downloaded; $attempt++) {
+        for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $candidateSuccess; $attempt++) {
             Write-Host ("Downloading {0} [web={1}] ..." -f $entry, $webCandidate)
-            Remove-IfExists -Path $tmpPath
+            Remove-IfExists -Path $candidateTmpPath
 
             $wgetArgs = @(
                 "--user=$Username",
@@ -299,10 +300,9 @@ foreach ($entry in $topics) {
                 "--trust-server-names",
                 "--max-redirect=10",
                 "--server-response",
-                "--auth-no-challenge",
                 "--keep-session-cookies",
                 "--save-cookies=$cookieJar",
-                "--output-document=$tmpPath"
+                "--output-document=$candidateTmpPath"
             )
 
             if (Test-Path -LiteralPath $cookieJar) {
@@ -339,29 +339,30 @@ foreach ($entry in $topics) {
                     $candidateError = ("wget exit code {0}: {1}" -f $exitCode, $wgetMessage)
                 }
             }
-            elseif (-not (Test-Path -LiteralPath $tmpPath)) {
+            elseif (-not (Test-Path -LiteralPath $candidateTmpPath)) {
                 $candidateError = "Output file was not created."
             }
-            elseif ((Get-Item -LiteralPath $tmpPath).Length -eq 0) {
+            elseif ((Get-Item -LiteralPath $candidateTmpPath).Length -eq 0) {
                 $candidateError = "Downloaded file is empty."
             }
-            elseif (-not (Test-PdfSignature -Path $tmpPath)) {
+            elseif (-not (Test-PdfSignature -Path $candidateTmpPath)) {
                 $candidateError = "Downloaded file is not a valid PDF."
             }
-            elseif (Test-IsGuestPlaceholderPdf -Path $tmpPath) {
-                $candidateError = "Downloaded PDF contains guest/placeholder content."
-            }
             else {
-                Move-Item -LiteralPath $tmpPath -Destination $pdfPath -Force
-                $downloaded = $true
-                $ok++
-                if ($webCandidate -ne $BaseWeb) {
-                    Write-Host ("Resolved {0} via fallback web {1}" -f $entry, $webCandidate)
-                }
+                $candidateSize = (Get-Item -LiteralPath $candidateTmpPath).Length
+                $isPlaceholder = Test-IsGuestPlaceholderPdf -Path $candidateTmpPath
+                [void]$candidateResults.Add([pscustomobject]@{
+                    Web = $webCandidate
+                    Url = $topicUrl
+                    Path = $candidateTmpPath
+                    Size = $candidateSize
+                    IsPlaceholder = $isPlaceholder
+                })
+                $candidateSuccess = $true
             }
 
-            if (-not $downloaded) {
-                Remove-IfExists -Path $tmpPath
+            if (-not $candidateSuccess) {
+                Remove-IfExists -Path $candidateTmpPath
                 if ($attempt -lt ($RetryCount + 1)) {
                     Write-Warning ("Attempt {0} failed for {1} on web {2}. Retrying..." -f $attempt, $entry, $webCandidate)
                     Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
@@ -369,7 +370,7 @@ foreach ($entry in $topics) {
             }
         }
 
-        if (-not $downloaded) {
+        if (-not $candidateSuccess) {
             if ([string]::IsNullOrWhiteSpace($candidateError)) {
                 $candidateError = "Unknown error"
             }
@@ -377,7 +378,36 @@ foreach ($entry in $topics) {
         }
     }
 
-    if (-not $downloaded) {
+    $selected = $null
+    if ($candidateResults.Count -gt 0) {
+        $nonPlaceholder = @($candidateResults | Where-Object { -not $_.IsPlaceholder })
+        if ($nonPlaceholder.Count -gt 0) {
+            $selected = ($nonPlaceholder | Sort-Object -Property Size -Descending | Select-Object -First 1)
+        }
+        else {
+            [void]$allErrors.Add("All candidate webs returned placeholder PDFs.")
+        }
+    }
+
+    if ($null -ne $selected) {
+        Move-Item -LiteralPath $selected.Path -Destination $pdfPath -Force
+        $downloaded = $true
+        $ok++
+
+        foreach ($r in $candidateResults) {
+            if ($r.Path -ne $selected.Path) {
+                Remove-IfExists -Path $r.Path
+            }
+        }
+
+        if ($selected.Web -ne $BaseWeb) {
+            Write-Host ("Resolved {0} via fallback web {1}" -f $entry, $selected.Web)
+        }
+    }
+    else {
+        foreach ($r in $candidateResults) {
+            Remove-IfExists -Path $r.Path
+        }
         $combinedError = if ($allErrors.Count -gt 0) { [string]::Join(" | ", $allErrors.ToArray()) } else { "Unknown failure" }
         Write-Warning ("Failed to download {0}. Error: {1}" -f $entry, $combinedError)
         Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}" -f (Get-Date -Format "s"), $entry, $combinedError)
