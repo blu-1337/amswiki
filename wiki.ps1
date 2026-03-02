@@ -8,10 +8,13 @@ param(
     [string]$OutputDir = "wiki_output",
     [string]$HtmlQueryString = "skin=plain;template=viewplain",
     [string]$WkhtmltopdfPath = "wkhtmltox/bin/wkhtmltopdf.exe",
-    [int]$RetryCount = 2,
+    [int]$RetryCount = 1,
     [switch]$Overwrite,
     [switch]$KeepHtml,
-    [switch]$SkipPlaceholderCheck
+    [switch]$SkipPlaceholderCheck,
+    [switch]$SkipAssetMirror,
+    [switch]$ShowServerResponse,
+    [switch]$NoSessionWarmup
 )
 
 Set-StrictMode -Version Latest
@@ -238,12 +241,35 @@ function Write-RunLog {
     Add-Content -LiteralPath $LogFile -Value $line
 }
 
+function Invoke-WgetCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $oldEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $Executable @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldEap
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $output
+    }
+}
+
 $scriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { (Get-Location).ProviderPath } else { $PSScriptRoot }
 $topicsPath = Resolve-AbsolutePath -Path $TopicsFile -BasePath $scriptDir
 $outputPath = Resolve-AbsolutePath -Path $OutputDir -BasePath $scriptDir
 $tmpRoot = Join-Path -Path $outputPath -ChildPath "_tmp"
 $downloadLog = Join-Path -Path $outputPath -ChildPath "wiki_download.log"
 $failedLog = Join-Path -Path $outputPath -ChildPath "wiki_failed.log"
+$cookieJar = Join-Path -Path $outputPath -ChildPath "wiki_session.cookies.txt"
 $base = $BaseViewAuthUrl.TrimEnd("/")
 $query = if ([string]::IsNullOrWhiteSpace($HtmlQueryString)) { "" } else { "?" + $HtmlQueryString.TrimStart("?") }
 
@@ -271,6 +297,7 @@ if (-not (Test-Path -LiteralPath $outputPath)) {
 if (-not (Test-Path -LiteralPath $tmpRoot)) {
     New-Item -ItemType Directory -Path $tmpRoot | Out-Null
 }
+Remove-IfExists -Path $cookieJar
 
 if (-not (Test-Path -LiteralPath $downloadLog)) {
     Add-Content -LiteralPath $downloadLog -Value "timestamp`tlevel`ttopic`tmessage`turl"
@@ -302,11 +329,60 @@ Write-Host ("Topics file   : {0}" -f $topicsPath)
 Write-Host ("Output dir    : {0}" -f $outputPath)
 Write-Host ("wget.exe      : {0}" -f $wgetExe)
 Write-Host ("wkhtmltopdf   : {0}" -f $wkhtmlExe)
+Write-Host ("Cookie jar    : {0}" -f $cookieJar)
+Write-Host ("RetryCount    : {0}" -f $RetryCount)
+if ($SkipAssetMirror) {
+    Write-Host "Asset mirror  : OFF (faster)"
+}
+else {
+    Write-Host "Asset mirror  : ON"
+}
+if ($NoSessionWarmup) {
+    Write-Host "Session warmup: OFF"
+}
+else {
+    Write-Host "Session warmup: ON"
+}
 Write-Host ("Download log  : {0}" -f $downloadLog)
 Write-Host ("Failed log    : {0}" -f $failedLog)
 Write-Host ""
 
 Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message ("RUN_START topics={0}" -f $topics.Count)
+
+$warmupTopicUrl = "{0}/{1}/WebHome{2}" -f $base, (Encode-WebPath -WebPath $DefaultWeb), $query
+
+if (-not $NoSessionWarmup) {
+    $warmupHtml = Join-Path -Path $tmpRoot -ChildPath "_warmup.html"
+    Remove-IfExists -Path $warmupHtml
+
+    $warmupArgs = @(
+        "--user=$Username",
+        "--password=$password",
+        "--max-redirect=10",
+        "--auth-no-challenge",
+        "--keep-session-cookies",
+        "--save-cookies=$cookieJar",
+        "--output-document=$warmupHtml"
+    )
+    if (Test-Path -LiteralPath $cookieJar) {
+        $warmupArgs += "--load-cookies=$cookieJar"
+    }
+    if ($ShowServerResponse) {
+        $warmupArgs += "--server-response"
+    }
+    $warmupArgs += $warmupTopicUrl
+
+    $warmupResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $warmupArgs
+    if ($warmupResult.ExitCode -eq 0) {
+        Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message "Session warmup succeeded." -Url $warmupTopicUrl
+    }
+    else {
+        $warmMsg = ("Warmup exit code {0}: {1}" -f $warmupResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $warmupResult.Output))))
+        Write-Warning $warmMsg
+        Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic "-" -Message $warmMsg -Url $warmupTopicUrl
+    }
+    Remove-IfExists -Path $warmupHtml
+}
 
 $ok = 0
 $skipped = 0
@@ -357,20 +433,22 @@ foreach ($entry in $topics) {
             "--content-disposition",
             "--trust-server-names",
             "--max-redirect=10",
-            "--server-response",
+            "--auth-no-challenge",
+            "--keep-session-cookies",
+            "--save-cookies=$cookieJar",
             "--output-document=$htmlPath",
             $topicUrl
         )
+        if (Test-Path -LiteralPath $cookieJar) {
+            $wgetArgs += "--load-cookies=$cookieJar"
+        }
+        if ($ShowServerResponse) {
+            $wgetArgs += "--server-response"
+        }
 
-        $oldEap = $ErrorActionPreference
-        try {
-            $ErrorActionPreference = "Continue"
-            $wgetOutput = & $wgetExe @wgetArgs 2>&1
-            $wgetExit = $LASTEXITCODE
-        }
-        finally {
-            $ErrorActionPreference = $oldEap
-        }
+        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs
+        $wgetOutput = $wgetResult.Output
+        $wgetExit = $wgetResult.ExitCode
 
         if ($wgetExit -ne 0) {
             $lastError = ("wget exit code {0}: {1}" -f $wgetExit, (Shorten-Message -Text ([string]::Join(" ", $wgetOutput))))
@@ -385,39 +463,40 @@ foreach ($entry in $topics) {
             $lastError = "Downloaded HTML appears to be guest/placeholder content."
         }
         else {
-            # Second pass: fetch page requisites and rewrite links for reliable local rendering.
-            $assetError = ""
-            $assetArgs = @(
-                "--user=$Username",
-                "--password=$password",
-                "--content-disposition",
-                "--trust-server-names",
-                "--max-redirect=10",
-                "--server-response",
-                "--page-requisites",
-                "--convert-links",
-                "--adjust-extension",
-                "--no-host-directories",
-                "--directory-prefix=$assetsRoot",
-                $topicUrl
-            )
+            $htmlForPdf = $htmlPath
+            if (-not $SkipAssetMirror) {
+                # Second pass: fetch page requisites and rewrite links for reliable local rendering.
+                $assetArgs = @(
+                    "--user=$Username",
+                    "--password=$password",
+                    "--content-disposition",
+                    "--trust-server-names",
+                    "--max-redirect=10",
+                    "--auth-no-challenge",
+                    "--keep-session-cookies",
+                    "--save-cookies=$cookieJar",
+                    "--page-requisites",
+                    "--convert-links",
+                    "--adjust-extension",
+                    "--no-host-directories",
+                    "--directory-prefix=$assetsRoot",
+                    $topicUrl
+                )
+                if (Test-Path -LiteralPath $cookieJar) {
+                    $assetArgs += "--load-cookies=$cookieJar"
+                }
+                if ($ShowServerResponse) {
+                    $assetArgs += "--server-response"
+                }
 
-            $oldEapAsset = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                $assetOutput = & $wgetExe @assetArgs 2>&1
-                $assetExit = $LASTEXITCODE
-            }
-            finally {
-                $ErrorActionPreference = $oldEapAsset
-            }
+                $assetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $assetArgs
+                if ($assetResult.ExitCode -ne 0) {
+                    $assetError = ("Asset fetch warning (exit {0}): {1}" -f $assetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $assetResult.Output))))
+                    Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message $assetError -Url $topicUrl
+                }
 
-            if ($assetExit -ne 0) {
-                $assetError = ("Asset fetch warning (exit {0}): {1}" -f $assetExit, (Shorten-Message -Text ([string]::Join(" ", $assetOutput))))
-                Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message $assetError -Url $topicUrl
+                $htmlForPdf = Get-PreferredHtmlForConversion -SearchRoot $assetsRoot -TopicName $topic.TopicName -FallbackHtmlPath $htmlPath
             }
-
-            $htmlForPdf = Get-PreferredHtmlForConversion -SearchRoot $assetsRoot -TopicName $topic.TopicName -FallbackHtmlPath $htmlPath
 
             Write-Host ("[{0}/{1}] Converting HTML to PDF for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
 
