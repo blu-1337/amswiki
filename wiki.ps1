@@ -159,14 +159,10 @@ if ([string]::IsNullOrWhiteSpace($Username)) {
     throw "Username is empty. Pass -Username explicitly (example: -Username g1hdmgs)."
 }
 
-$wgetCmd = Get-Command wget.exe -ErrorAction SilentlyContinue
-if ($null -eq $wgetCmd) {
-    $wgetCmd = Get-Command wget -CommandType Application -ErrorAction SilentlyContinue
+$wgetExe = Join-Path -Path $scriptDir -ChildPath "wget.exe"
+if (-not (Test-Path -LiteralPath $wgetExe)) {
+    throw ("wget.exe was not found next to wiki.ps1. Expected location: {0}" -f $wgetExe)
 }
-if ($null -eq $wgetCmd) {
-    throw "GNU wget executable was not found. Ensure wget.exe is installed and on PATH."
-}
-$wgetExe = $wgetCmd.Source
 
 if (-not (Test-Path -LiteralPath $topicsPath)) {
     throw ("Topics file not found: {0}" -f $topicsPath)
@@ -200,6 +196,7 @@ Write-Host ("Base URL   : {0}" -f $base)
 Write-Host ("Base Web   : {0}" -f $BaseWeb)
 Write-Host ("Topics file: {0}" -f $topicsPath)
 Write-Host ("Output dir : {0}" -f $outputPath)
+Write-Host ("wget.exe   : {0}" -f $wgetExe)
 if ($AskPasswordPerDownload) {
     Write-Host "Auth mode  : wget --ask-password for each download"
 }
