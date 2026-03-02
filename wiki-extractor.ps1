@@ -2,9 +2,10 @@
 [CmdletBinding()]
 param(
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
-    [string]$TopicsFile = "topics.txt",      # Each line: Web/TopicName
+    [string]$TopicsFile = "topics.txt",      # Each line: TopicName OR Web/TopicName
     [string]$OutputDir = "wiki_output",
     [string]$QueryString = "skin=;",
+    [string]$DefaultWeb = "PPService",       # Used when a topic line does not contain '/'
     [int]$RetryCount = 2,
     [switch]$Overwrite
 )
@@ -47,6 +48,25 @@ function Convert-TopicToUrlPath {
     return (($parts | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join "/")
 }
 
+function Normalize-TopicPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Topic,
+        [string]$DefaultWeb
+    )
+
+    $cleanTopic = $Topic.Trim("/")
+    if ($cleanTopic -match "/") {
+        return $cleanTopic
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($DefaultWeb)) {
+        return "$($DefaultWeb.Trim('/'))/$cleanTopic"
+    }
+
+    return $cleanTopic
+}
+
 function Test-IsPdfFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -74,6 +94,35 @@ function Test-IsPdfFile {
 
     $header = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 5)
     return $header -eq "%PDF-"
+}
+
+function Get-RequestErrorMessage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $msg = $ErrorRecord.Exception.Message
+
+    try {
+        $response = $ErrorRecord.Exception.Response
+        if ($null -ne $response) {
+            $statusCode = [int]$response.StatusCode
+            $statusDescription = $response.StatusDescription
+            $contentType = $response.ContentType
+
+            $details = "HTTP $statusCode $statusDescription"
+            if (-not [string]::IsNullOrWhiteSpace($contentType)) {
+                $details = "$details; Content-Type: $contentType"
+            }
+            $msg = "$msg ($details)"
+        }
+    }
+    catch {
+        # Best-effort enrichment only; keep original message if metadata isn't available.
+    }
+
+    return $msg
 }
 
 $scriptBase = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { (Get-Location).ProviderPath }
@@ -108,6 +157,7 @@ Write-Host "Script dir : $scriptBase"
 Write-Host "Base URL   : $base"
 Write-Host "Topics file: $TopicsFile"
 Write-Host "Output dir : $OutputDir"
+Write-Host "Default web: $DefaultWeb"
 Write-Host ""
 
 foreach ($topic in $topics) {
@@ -126,7 +176,8 @@ foreach ($topic in $topics) {
         Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
     }
 
-    $urlPath = Convert-TopicToUrlPath -Topic $topic
+    $topicPath = Normalize-TopicPath -Topic $topic -DefaultWeb $DefaultWeb
+    $urlPath = Convert-TopicToUrlPath -Topic $topicPath
     if ([string]::IsNullOrWhiteSpace($QueryString)) {
         $uri = "$base/$($urlPath)"
     }
@@ -175,7 +226,7 @@ foreach ($topic in $topics) {
                 Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
             }
             else {
-                $msg = $_.Exception.Message
+                $msg = Get-RequestErrorMessage -ErrorRecord $_
                 Write-Warning "Failed to download ${topic}. Error: $msg"
                 Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}" -f (Get-Date -Format "s"), $topic, $msg)
                 $failed++
