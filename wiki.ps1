@@ -1,15 +1,18 @@
-#Requires -Version 5.1
+# ==============================================
+# wiki.ps1 - Bulk export Foswiki topics to PDF
+# PowerShell 5+ / 7+ using curl.exe + negotiate auth
+# ==============================================
+
 [CmdletBinding()]
 param(
+    [string]$BaseWeb = "System",
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
-    [string]$TopicsFile = "topics.txt",       # Each line: TopicName OR Web/TopicName
-    [string]$Topic = "",                      # Optional single topic for quick testing
+    [string]$TopicsFile = "topics.txt",
     [string]$OutputDir = "wiki_output",
-    [string]$DefaultWeb = "PPService",        # Applied when line has only topic name
-    [string]$QueryString = "",                # Example: "skin=genpdf,pattern"
+    [string]$QueryString = "skin=;",
     [int]$RetryCount = 2,
     [switch]$Overwrite,
-    [switch]$KeepDebugResponses
+    [switch]$SkipContentValidation
 )
 
 Set-StrictMode -Version Latest
@@ -31,86 +34,32 @@ function Resolve-AbsolutePath {
 }
 
 function Get-SafeFileName {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Topic
-    )
-
+    param([Parameter(Mandatory = $true)][string]$Topic)
     return ($Topic -replace "[\\/:*?`"<>|]", "_")
 }
 
-function Normalize-TopicPath {
+function Get-TopicPath {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Topic,
-        [string]$DefaultWeb
+        [Parameter(Mandatory = $true)][string]$Topic,
+        [Parameter(Mandatory = $true)][string]$DefaultWeb
     )
 
-    $cleanTopic = $Topic.Trim("/")
-    if ($cleanTopic -match "/") {
-        return $cleanTopic
+    $clean = $Topic.Trim()
+    if ($clean -match "/") {
+        return $clean.Trim("/")
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($DefaultWeb)) {
-        return "$($DefaultWeb.Trim('/'))/$cleanTopic"
-    }
-
-    return $cleanTopic
+    return ($DefaultWeb.Trim("/") + "/" + $clean.Trim("/"))
 }
 
-function Convert-TopicToUrlPath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$TopicPath
-    )
-
+function Encode-TopicPath {
+    param([Parameter(Mandatory = $true)][string]$TopicPath)
     $parts = $TopicPath.Trim("/") -split "/"
     return (($parts | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join "/")
 }
 
-function Get-UriCandidates {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Base,
-        [Parameter(Mandatory = $true)]
-        [string]$UrlPath,
-        [string]$QueryString
-    )
-
-    $seen = @{}
-    $list = New-Object System.Collections.Generic.List[string]
-
-    function Add-UriCandidate {
-        param([string]$Uri)
-        if (-not $seen.ContainsKey($Uri)) {
-            $seen[$Uri] = $true
-            [void]$list.Add($Uri)
-        }
-    }
-
-    $cleanQuery = $null
-    if (-not [string]::IsNullOrWhiteSpace($QueryString)) {
-        $cleanQuery = $QueryString.Trim().TrimStart("?")
-    }
-
-    Add-UriCandidate -Uri "$Base/$UrlPath"
-    if (-not [string]::IsNullOrWhiteSpace($cleanQuery)) {
-        Add-UriCandidate -Uri "$Base/$UrlPath?$cleanQuery"
-    }
-
-    # Useful fallback for many Foswiki GenPDF setups.
-    if (($Base -match "/genpdf/?$") -and ([string]::IsNullOrWhiteSpace($cleanQuery) -or ($cleanQuery -notmatch "(^|&)skin="))) {
-        Add-UriCandidate -Uri "$Base/$UrlPath?skin=genpdf,pattern"
-    }
-
-    return $list
-}
-
-function Test-PdfSignature {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
+function Test-PdfHeader {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return $false
@@ -133,18 +82,10 @@ function Test-PdfSignature {
 }
 
 function Get-FileSnippet {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [int]$ByteLimit = 262144
-    )
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return ""
-    }
-
-    $limit = [Math]::Max(1024, $ByteLimit)
-    $buffer = New-Object byte[] $limit
+    $maxBytes = 1048576
+    $buffer = New-Object byte[] $maxBytes
     $stream = [System.IO.File]::OpenRead($Path)
     try {
         $read = $stream.Read($buffer, 0, $buffer.Length)
@@ -160,289 +101,145 @@ function Get-FileSnippet {
     return [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
 }
 
-function Get-HeaderValueFromDump {
-    param(
-        [string]$HeaderFile,
-        [Parameter(Mandatory = $true)]
-        [string]$HeaderName
-    )
+function Test-BadPdfContent {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-    if ([string]::IsNullOrWhiteSpace($HeaderFile) -or -not (Test-Path -LiteralPath $HeaderFile)) {
-        return $null
+    if ($SkipContentValidation) {
+        return $false
     }
 
-    $pattern = "^\s*" + [Regex]::Escape($HeaderName) + "\s*:\s*(.+)\s*$"
-    $matches = @()
-    foreach ($line in (Get-Content -LiteralPath $HeaderFile -ErrorAction SilentlyContinue)) {
-        if ($line -imatch $pattern) {
-            $matches += $Matches[1]
-        }
-    }
-
-    if ($matches.Count -gt 0) {
-        return $matches[-1]
-    }
-
-    return $null
-}
-
-function Get-PdfValidationError {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [string]$ResponseContentType
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return "Output file was not created."
-    }
-
-    $size = (Get-Item -LiteralPath $Path).Length
-    if ($size -le 0) {
-        return "Downloaded file is empty."
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ResponseContentType)) {
-        if ($ResponseContentType -notmatch "pdf|octet-stream") {
-            return "Unexpected content type: $ResponseContentType"
-        }
-    }
-
-    if (-not (Test-PdfSignature -Path $Path)) {
-        return "Downloaded file is not a PDF."
-    }
-
-    # Detect common guest/fallback document symptoms.
-    $snippet = Get-FileSnippet -Path $Path -ByteLimit 1048576
+    $snippet = Get-FileSnippet -Path $Path
     $markers = @(
         "Topic revision: 1970-01-01",
         "WikiGuest",
         "RENDERZONE{",
         "This topic:"
     )
-    $hits = @($markers | Where-Object { $snippet -like "*$_*" })
-    if ($hits.Count -ge 2) {
-        return "PDF content looks like guest/placeholder topic output."
-    }
-
-    return $null
+    $hitCount = @($markers | Where-Object { $snippet -like ("*" + $_ + "*") }).Count
+    return ($hitCount -ge 2)
 }
 
-function Download-WithCurl {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Uri,
-        [Parameter(Mandatory = $true)]
-        [string]$OutFile,
-        [ref]$HeaderDumpFile,
-        [ref]$ErrorMessage
-    )
-
-    $headerFile = [System.IO.Path]::GetTempFileName()
-    $HeaderDumpFile.Value = $headerFile
-
-    $curlArgs = @(
-        "--negotiate",
-        "-u", ":",
-        "--location",
-        "--silent",
-        "--show-error",
-        "--fail",
-        "--connect-timeout", "20",
-        "--output", $OutFile,
-        "--dump-header", $headerFile,
-        $Uri
-    )
-
-    $output = & $script:CurlExe @curlArgs 2>&1
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        $ErrorMessage.Value = "curl exit $exitCode: $([string]::Join(' ', $output))"
-        return $false
-    }
-
-    return $true
-}
-
-function Download-WithInvokeWebRequest {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Uri,
-        [Parameter(Mandatory = $true)]
-        [string]$OutFile,
-        [ref]$HeaderDumpFile,
-        [ref]$ErrorMessage
-    )
-
-    try {
-        $response = Invoke-WebRequest `
-            -Uri $Uri `
-            -OutFile $OutFile `
-            -UseDefaultCredentials `
-            -UseBasicParsing `
-            -MaximumRedirection 10 `
-            -Headers @{ Accept = "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8" } `
-            -ErrorAction Stop
-
-        $headerFile = [System.IO.Path]::GetTempFileName()
-        $lines = @()
-        if ($null -ne $response.Headers) {
-            foreach ($key in $response.Headers.AllKeys) {
-                $lines += "$key: $($response.Headers[$key])"
-            }
-        }
-        Set-Content -LiteralPath $headerFile -Value $lines -Encoding ASCII
-        $HeaderDumpFile.Value = $headerFile
-        return $true
-    }
-    catch {
-        $ErrorMessage.Value = $_.Exception.Message
-        return $false
-    }
-}
-
-function Remove-FileIfExists {
+function Remove-IfExists {
     param([string]$Path)
     if (Test-Path -LiteralPath $Path) {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     }
 }
 
-$scriptBase = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { (Get-Location).ProviderPath }
-$TopicsFile = Resolve-AbsolutePath -Path $TopicsFile -BasePath $scriptBase
-$OutputDir = Resolve-AbsolutePath -Path $OutputDir -BasePath $scriptBase
+$scriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { (Get-Location).ProviderPath } else { $PSScriptRoot }
+$topicsPath = Resolve-AbsolutePath -Path $TopicsFile -BasePath $scriptDir
+$outputPath = Resolve-AbsolutePath -Path $OutputDir -BasePath $scriptDir
+$failedLog = Join-Path -Path $outputPath -ChildPath "wiki_failed.log"
+$base = $BaseURL.TrimEnd("/")
+$query = if ([string]::IsNullOrWhiteSpace($QueryString)) { "" } else { "?" + $QueryString.TrimStart("?") }
 
-if (-not (Test-Path -LiteralPath $TopicsFile)) {
-    throw "Topics file not found: $TopicsFile"
+$curlCmd = Get-Command curl.exe -ErrorAction SilentlyContinue
+if ($null -eq $curlCmd) {
+    throw "curl.exe was not found. Please install curl or use Windows with curl.exe available."
+}
+$curlExe = $curlCmd.Source
+
+if (-not (Test-Path -LiteralPath $topicsPath)) {
+    throw ("Topics file not found: {0}" -f $topicsPath)
 }
 
-if (-not (Test-Path -LiteralPath $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir | Out-Null
+if (-not (Test-Path -LiteralPath $outputPath)) {
+    New-Item -ItemType Directory -Path $outputPath | Out-Null
 }
 
-$curlCommand = Get-Command curl.exe -ErrorAction SilentlyContinue
-$script:CurlExe = if ($null -ne $curlCommand) { $curlCommand.Source } else { $null }
-$downloadMethod = if ($null -ne $script:CurlExe) { "curl.exe --negotiate" } else { "Invoke-WebRequest (fallback)" }
-
-$failedLog = Join-Path -Path $OutputDir -ChildPath "wiki_failed.log"
-if (-not [string]::IsNullOrWhiteSpace($Topic)) {
-    $topics = @($Topic.Trim())
-}
-else {
-    $topics = Get-Content -LiteralPath $TopicsFile |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
-}
+$topics = Get-Content -LiteralPath $topicsPath |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
 
 if ($topics.Count -eq 0) {
-    Write-Warning "No topics found in $TopicsFile"
+    Write-Warning ("No topics found in {0}" -f $topicsPath)
     exit 0
 }
 
 $ok = 0
 $skipped = 0
 $failed = 0
-$base = $BaseURL.TrimEnd("/")
 
-Write-Host "Starting bulk PDF export..."
-Write-Host "Script dir       : $scriptBase"
-Write-Host "Base URL         : $base"
-Write-Host "Topics file      : $TopicsFile"
-Write-Host "Output dir       : $OutputDir"
-Write-Host "Default web      : $DefaultWeb"
-Write-Host "Request method   : $downloadMethod"
-Write-Host "Query string     : $QueryString"
+Write-Host "Starting bulk PDF export using Windows session authentication..."
+Write-Host ("Base URL   : {0}" -f $base)
+Write-Host ("Base Web   : {0}" -f $BaseWeb)
+Write-Host ("Topics file: {0}" -f $topicsPath)
+Write-Host ("Output dir : {0}" -f $outputPath)
 Write-Host ""
 
 foreach ($topic in $topics) {
-    $topicPath = Normalize-TopicPath -Topic $topic -DefaultWeb $DefaultWeb
     $safeName = Get-SafeFileName -Topic $topic
-    $outFile = Join-Path -Path $OutputDir -ChildPath "$safeName.pdf"
-    $tmpFile = "$outFile.download"
+    $pdfPath = Join-Path -Path $outputPath -ChildPath ($safeName + ".pdf")
+    $tmpPath = $pdfPath + ".download"
 
-    if ((-not $Overwrite) -and (Test-Path -LiteralPath $outFile)) {
-        $existingValidation = Get-PdfValidationError -Path $outFile -ResponseContentType "application/pdf"
-        if ($null -eq $existingValidation) {
-            Write-Host "Skipping $topic (already downloaded)"
+    if ((-not $Overwrite) -and (Test-Path -LiteralPath $pdfPath)) {
+        $existingSize = (Get-Item -LiteralPath $pdfPath).Length
+        if (($existingSize -gt 0) -and (Test-PdfHeader -Path $pdfPath) -and (-not (Test-BadPdfContent -Path $pdfPath))) {
+            Write-Host ("Skipping {0} (already downloaded)" -f $topic)
             $skipped++
             continue
         }
 
-        Write-Warning "Existing file for $topic is invalid ($existingValidation). Re-downloading..."
-        Remove-FileIfExists -Path $outFile
+        Remove-IfExists -Path $pdfPath
     }
 
-    $urlPath = Convert-TopicToUrlPath -TopicPath $topicPath
-    $uriCandidates = Get-UriCandidates -Base $base -UrlPath $urlPath -QueryString $QueryString
+    $topicPath = Get-TopicPath -Topic $topic -DefaultWeb $BaseWeb
+    $encodedPath = Encode-TopicPath -TopicPath $topicPath
+    $topicUrl = "{0}/{1}{2}" -f $base, $encodedPath, $query
 
     $downloaded = $false
-    $lastFailure = ""
+    $lastError = ""
 
     for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $downloaded; $attempt++) {
-        foreach ($uri in $uriCandidates) {
-            Remove-FileIfExists -Path $tmpFile
-            $headerDump = $null
-            $requestError = $null
+        Remove-IfExists -Path $tmpPath
+        Write-Host ("Downloading {0} ..." -f $topic)
 
-            Write-Host "Downloading $topic (attempt $attempt) from $uri"
+        $curlArgs = @(
+            "--negotiate",
+            "-u", ":",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--output", $tmpPath,
+            $topicUrl
+        )
 
-            $okRequest = $false
-            if ($null -ne $script:CurlExe) {
-                $okRequest = Download-WithCurl -Uri $uri -OutFile $tmpFile -HeaderDumpFile ([ref]$headerDump) -ErrorMessage ([ref]$requestError)
-            }
-            else {
-                $okRequest = Download-WithInvokeWebRequest -Uri $uri -OutFile $tmpFile -HeaderDumpFile ([ref]$headerDump) -ErrorMessage ([ref]$requestError)
-            }
+        & $curlExe @curlArgs 2>$null
+        $exitCode = $LASTEXITCODE
 
-            if (-not $okRequest) {
-                $lastFailure = "Request failed: $requestError"
-                if (-not [string]::IsNullOrWhiteSpace($headerDump) -and (Test-Path -LiteralPath $headerDump)) {
-                    Remove-FileIfExists -Path $headerDump
-                }
-                continue
-            }
-
-            $contentType = Get-HeaderValueFromDump -HeaderFile $headerDump -HeaderName "Content-Type"
-            $validationError = Get-PdfValidationError -Path $tmpFile -ResponseContentType $contentType
-            if ($null -eq $validationError) {
-                Move-Item -LiteralPath $tmpFile -Destination $outFile -Force
-                if (-not [string]::IsNullOrWhiteSpace($headerDump) -and (Test-Path -LiteralPath $headerDump)) {
-                    Remove-FileIfExists -Path $headerDump
-                }
-                $downloaded = $true
-                $ok++
-                break
-            }
-
-            $lastFailure = "Validation failed: $validationError (Content-Type: $contentType)"
-            if ($KeepDebugResponses) {
-                $debugPath = Join-Path -Path $OutputDir -ChildPath "$safeName.debug.txt"
-                $snippet = Get-FileSnippet -Path $tmpFile -ByteLimit 32768
-                Set-Content -LiteralPath $debugPath -Value @(
-                    "URI: $uri",
-                    "Validation: $validationError",
-                    "Content-Type: $contentType",
-                    "",
-                    "Snippet:",
-                    $snippet
-                ) -Encoding UTF8
-            }
-
-            Remove-FileIfExists -Path $tmpFile
-            if (-not [string]::IsNullOrWhiteSpace($headerDump) -and (Test-Path -LiteralPath $headerDump)) {
-                Remove-FileIfExists -Path $headerDump
-            }
+        if ($exitCode -ne 0) {
+            $lastError = ("curl exit code {0} (url: {1})" -f $exitCode, $topicUrl)
+        }
+        elseif (-not (Test-Path -LiteralPath $tmpPath)) {
+            $lastError = "Download finished but file was not created."
+        }
+        elseif ((Get-Item -LiteralPath $tmpPath).Length -eq 0) {
+            $lastError = "Downloaded file is empty."
+        }
+        elseif (-not (Test-PdfHeader -Path $tmpPath)) {
+            $lastError = "Downloaded file is not a PDF."
+        }
+        elseif (Test-BadPdfContent -Path $tmpPath) {
+            $lastError = "Downloaded PDF contains guest/placeholder wiki content."
+        }
+        else {
+            Move-Item -LiteralPath $tmpPath -Destination $pdfPath -Force
+            $downloaded = $true
+            $ok++
+            continue
         }
 
-        if (-not $downloaded -and $attempt -lt ($RetryCount + 1)) {
-            Write-Warning "Attempt $attempt failed for $topic. Retrying..."
+        Remove-IfExists -Path $tmpPath
+        if ($attempt -lt ($RetryCount + 1)) {
+            Write-Warning ("Attempt {0} failed for {1}. Retrying..." -f $attempt, $topic)
             Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
         }
     }
 
     if (-not $downloaded) {
-        Write-Warning "Failed to download $topic. $lastFailure"
-        Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}" -f (Get-Date -Format "s"), $topic, $lastFailure)
+        Write-Warning ("Failed to download {0}. Error: {1}" -f $topic, $lastError)
+        Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}" -f (Get-Date -Format "s"), $topic, $lastError)
         $failed++
     }
 }
@@ -451,5 +248,5 @@ Write-Host ""
 Write-Host "Done."
 Write-Host ("Successful: {0}  Skipped: {1}  Failed: {2}" -f $ok, $skipped, $failed)
 if ($failed -gt 0) {
-    Write-Host "Failed topics logged to: $failedLog"
+    Write-Host ("Failed topics logged to: {0}" -f $failedLog)
 }
