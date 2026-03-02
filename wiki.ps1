@@ -7,6 +7,7 @@
 param(
     [string]$Username = $env:USERNAME,                     # Example: g1hdmgs or DOMAIN\g1hdmgs
     [string]$BaseWeb = "System",
+    [string[]]$FallbackWebs = @("PPService"),
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
     [string]$TopicsFile = "topics.txt",
     [string]$OutputDir = "wiki_output",
@@ -118,10 +119,9 @@ function Test-IsGuestPlaceholderPdf {
     return ($hitCount -ge 2)
 }
 
-function Split-TopicEntry {
+function Parse-TopicEntry {
     param(
-        [Parameter(Mandatory = $true)][string]$Entry,
-        [Parameter(Mandatory = $true)][string]$DefaultWeb
+        [Parameter(Mandatory = $true)][string]$Entry
     )
 
     $clean = $Entry.Trim().Trim("/")
@@ -129,17 +129,15 @@ function Split-TopicEntry {
         return $null
     }
 
+    $webPath = $null
+    $topicName = $clean
     if ($clean.Contains("/")) {
         $idx = $clean.LastIndexOf("/")
         $webPath = $clean.Substring(0, $idx).Trim("/")
         $topicName = $clean.Substring($idx + 1).Trim("/")
     }
-    else {
-        $webPath = $DefaultWeb.Trim("/")
-        $topicName = $clean
-    }
 
-    if ([string]::IsNullOrWhiteSpace($webPath) -or [string]::IsNullOrWhiteSpace($topicName)) {
+    if ([string]::IsNullOrWhiteSpace($topicName)) {
         return $null
     }
 
@@ -154,10 +152,43 @@ function Encode-WebPath {
     return (($WebPath -split "/") | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join "/"
 }
 
+function Get-WebCandidatesForEntry {
+    param(
+        [Parameter(Mandatory = $true)]$ParsedEntry,
+        [Parameter(Mandatory = $true)][string]$BaseWeb,
+        [string[]]$FallbackWebs
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ParsedEntry.WebPath)) {
+        return @($ParsedEntry.WebPath)
+    }
+
+    $ordered = @()
+    if (-not [string]::IsNullOrWhiteSpace($BaseWeb)) {
+        $ordered += $BaseWeb
+    }
+    if ($null -ne $FallbackWebs) {
+        $ordered += $FallbackWebs
+    }
+
+    $unique = New-Object System.Collections.Generic.List[string]
+    foreach ($w in $ordered) {
+        if ($null -eq $w) { continue }
+        $clean = $w.Trim().Trim("/")
+        if ([string]::IsNullOrWhiteSpace($clean)) { continue }
+        if (-not $unique.Contains($clean)) {
+            [void]$unique.Add($clean)
+        }
+    }
+
+    return $unique.ToArray()
+}
+
 $scriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { (Get-Location).ProviderPath } else { $PSScriptRoot }
 $topicsPath = Resolve-AbsolutePath -Path $TopicsFile -BasePath $scriptDir
 $outputPath = Resolve-AbsolutePath -Path $OutputDir -BasePath $scriptDir
 $failedLog = Join-Path -Path $outputPath -ChildPath "wiki_failed.log"
+$cookieJar = Join-Path -Path $outputPath -ChildPath "wiki_session.cookies.txt"
 $base = $BaseURL.TrimEnd("/")
 $query = if ([string]::IsNullOrWhiteSpace($QueryString)) { "" } else { "?" + $QueryString.TrimStart("?") }
 
@@ -177,6 +208,7 @@ if (-not (Test-Path -LiteralPath $topicsPath)) {
 if (-not (Test-Path -LiteralPath $outputPath)) {
     New-Item -ItemType Directory -Path $outputPath | Out-Null
 }
+Remove-IfExists -Path $cookieJar
 
 $topics = Get-Content -LiteralPath $topicsPath |
     ForEach-Object { $_.Trim() } |
@@ -200,9 +232,13 @@ Write-Host "Starting bulk PDF export using GNU wget..."
 Write-Host ("Username   : {0}" -f $Username)
 Write-Host ("Base URL   : {0}" -f $base)
 Write-Host ("Base Web   : {0}" -f $BaseWeb)
+if ($FallbackWebs.Count -gt 0) {
+    Write-Host ("Fallbacks  : {0}" -f ([string]::Join(", ", $FallbackWebs)))
+}
 Write-Host ("Topics file: {0}" -f $topicsPath)
 Write-Host ("Output dir : {0}" -f $outputPath)
 Write-Host ("wget.exe   : {0}" -f $wgetExe)
+Write-Host ("Cookie jar : {0}" -f $cookieJar)
 if ($AskPasswordPerDownload) {
     Write-Host "Auth mode  : wget --ask-password for each download"
 }
@@ -216,9 +252,15 @@ $skipped = 0
 $failed = 0
 
 foreach ($entry in $topics) {
-    $parts = Split-TopicEntry -Entry $entry -DefaultWeb $BaseWeb
-    if ($null -eq $parts) {
+    $parsed = Parse-TopicEntry -Entry $entry
+    if ($null -eq $parsed) {
         Write-Warning ("Skipping invalid topics entry: {0}" -f $entry)
+        continue
+    }
+
+    $webCandidates = Get-WebCandidatesForEntry -ParsedEntry $parsed -BaseWeb $BaseWeb -FallbackWebs $FallbackWebs
+    if (($null -eq $webCandidates) -or ($webCandidates.Count -eq 0)) {
+        Write-Warning ("No web candidates resolved for topic: {0}" -f $entry)
         continue
     }
 
@@ -237,86 +279,108 @@ foreach ($entry in $topics) {
         Remove-IfExists -Path $pdfPath
     }
 
-    $encodedWeb = Encode-WebPath -WebPath $parts.WebPath
-    $encodedTopic = [System.Uri]::EscapeDataString($parts.TopicName)
-    $topicUrl = "{0}/{1}/{2}{3}" -f $base, $encodedWeb, $encodedTopic, $query
-
     $downloaded = $false
-    $lastError = ""
+    $allErrors = New-Object System.Collections.Generic.List[string]
+    $encodedTopic = [System.Uri]::EscapeDataString($parsed.TopicName)
 
-    for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $downloaded; $attempt++) {
-        Write-Host ("Downloading {0} ..." -f $entry)
-        Remove-IfExists -Path $tmpPath
+    foreach ($webCandidate in $webCandidates) {
+        if ($downloaded) { break }
+        $encodedWeb = Encode-WebPath -WebPath $webCandidate
+        $topicUrl = "{0}/{1}/{2}{3}" -f $base, $encodedWeb, $encodedTopic, $query
+        $candidateError = ""
 
-        $wgetArgs = @(
-            "--user=$Username",
-            "--content-disposition",
-            "--trust-server-names",
-            "--max-redirect=10",
-            "--server-response",
-            "--output-document=$tmpPath"
-        )
+        for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $downloaded; $attempt++) {
+            Write-Host ("Downloading {0} [web={1}] ..." -f $entry, $webCandidate)
+            Remove-IfExists -Path $tmpPath
 
-        if ($AskPasswordPerDownload) {
-            $wgetArgs += "--ask-password"
-        }
-        else {
-            $wgetArgs += "--password=$password"
-        }
+            $wgetArgs = @(
+                "--user=$Username",
+                "--content-disposition",
+                "--trust-server-names",
+                "--max-redirect=10",
+                "--server-response",
+                "--auth-no-challenge",
+                "--keep-session-cookies",
+                "--save-cookies=$cookieJar",
+                "--output-document=$tmpPath"
+            )
 
-        $wgetArgs += $topicUrl
+            if (Test-Path -LiteralPath $cookieJar) {
+                $wgetArgs += "--load-cookies=$cookieJar"
+            }
 
-        $oldErrorActionPreference = $ErrorActionPreference
-        try {
-            # GNU wget writes progress/status to stderr even on success.
-            # Temporarily relax EAP so progress lines do not stop the script.
-            $ErrorActionPreference = "Continue"
-            $wgetOutput = & $wgetExe @wgetArgs 2>&1
-            $exitCode = $LASTEXITCODE
-        }
-        finally {
-            $ErrorActionPreference = $oldErrorActionPreference
-        }
-
-        if ($exitCode -ne 0) {
-            $wgetMessage = ([string]::Join(" ", $wgetOutput)).Trim()
-            if ([string]::IsNullOrWhiteSpace($wgetMessage)) {
-                $lastError = ("wget exit code {0}" -f $exitCode)
+            if ($AskPasswordPerDownload) {
+                $wgetArgs += "--ask-password"
             }
             else {
-                $lastError = ("wget exit code {0}: {1}" -f $exitCode, $wgetMessage)
+                $wgetArgs += "--password=$password"
             }
-        }
-        elseif (-not (Test-Path -LiteralPath $tmpPath)) {
-            $lastError = "Output file was not created."
-        }
-        elseif ((Get-Item -LiteralPath $tmpPath).Length -eq 0) {
-            $lastError = "Downloaded file is empty."
-        }
-        elseif (-not (Test-PdfSignature -Path $tmpPath)) {
-            $lastError = "Downloaded file is not a valid PDF."
-        }
-        elseif (Test-IsGuestPlaceholderPdf -Path $tmpPath) {
-            $lastError = "Downloaded PDF contains guest/placeholder content."
-        }
-        else {
-            Move-Item -LiteralPath $tmpPath -Destination $pdfPath -Force
-            $downloaded = $true
-            $ok++
+
+            $wgetArgs += $topicUrl
+
+            $oldErrorActionPreference = $ErrorActionPreference
+            try {
+                # GNU wget writes progress/status to stderr even on success.
+                # Temporarily relax EAP so progress lines do not stop the script.
+                $ErrorActionPreference = "Continue"
+                $wgetOutput = & $wgetExe @wgetArgs 2>&1
+                $exitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $oldErrorActionPreference
+            }
+
+            if ($exitCode -ne 0) {
+                $wgetMessage = ([string]::Join(" ", $wgetOutput)).Trim()
+                if ([string]::IsNullOrWhiteSpace($wgetMessage)) {
+                    $candidateError = ("wget exit code {0}" -f $exitCode)
+                }
+                else {
+                    $candidateError = ("wget exit code {0}: {1}" -f $exitCode, $wgetMessage)
+                }
+            }
+            elseif (-not (Test-Path -LiteralPath $tmpPath)) {
+                $candidateError = "Output file was not created."
+            }
+            elseif ((Get-Item -LiteralPath $tmpPath).Length -eq 0) {
+                $candidateError = "Downloaded file is empty."
+            }
+            elseif (-not (Test-PdfSignature -Path $tmpPath)) {
+                $candidateError = "Downloaded file is not a valid PDF."
+            }
+            elseif (Test-IsGuestPlaceholderPdf -Path $tmpPath) {
+                $candidateError = "Downloaded PDF contains guest/placeholder content."
+            }
+            else {
+                Move-Item -LiteralPath $tmpPath -Destination $pdfPath -Force
+                $downloaded = $true
+                $ok++
+                if ($webCandidate -ne $BaseWeb) {
+                    Write-Host ("Resolved {0} via fallback web {1}" -f $entry, $webCandidate)
+                }
+            }
+
+            if (-not $downloaded) {
+                Remove-IfExists -Path $tmpPath
+                if ($attempt -lt ($RetryCount + 1)) {
+                    Write-Warning ("Attempt {0} failed for {1} on web {2}. Retrying..." -f $attempt, $entry, $webCandidate)
+                    Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
+                }
+            }
         }
 
         if (-not $downloaded) {
-            Remove-IfExists -Path $tmpPath
-            if ($attempt -lt ($RetryCount + 1)) {
-                Write-Warning ("Attempt {0} failed for {1}. Retrying..." -f $attempt, $entry)
-                Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
+            if ([string]::IsNullOrWhiteSpace($candidateError)) {
+                $candidateError = "Unknown error"
             }
+            [void]$allErrors.Add(("{0}: {1}" -f $webCandidate, $candidateError))
         }
     }
 
     if (-not $downloaded) {
-        Write-Warning ("Failed to download {0}. Error: {1}" -f $entry, $lastError)
-        Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}`t{3}" -f (Get-Date -Format "s"), $entry, $lastError, $topicUrl)
+        $combinedError = if ($allErrors.Count -gt 0) { [string]::Join(" | ", $allErrors.ToArray()) } else { "Unknown failure" }
+        Write-Warning ("Failed to download {0}. Error: {1}" -f $entry, $combinedError)
+        Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}" -f (Get-Date -Format "s"), $entry, $combinedError)
         $failed++
     }
 }
