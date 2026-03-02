@@ -174,6 +174,39 @@ function Test-IsPlaceholderPdf {
     return ($text -like "*WikiGuest*" -and $text -like "*Topic revision: 1970-01-01*")
 }
 
+function Get-PreferredHtmlForConversion {
+    param(
+        [Parameter(Mandatory = $true)][string]$SearchRoot,
+        [Parameter(Mandatory = $true)][string]$TopicName,
+        [Parameter(Mandatory = $true)][string]$FallbackHtmlPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SearchRoot)) {
+        return $FallbackHtmlPath
+    }
+
+    $htmlFiles = @(
+        Get-ChildItem -LiteralPath $SearchRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in @(".html", ".htm") }
+    )
+
+    if ($htmlFiles.Count -eq 0) {
+        return $FallbackHtmlPath
+    }
+
+    $topicRegex = [Regex]::Escape($TopicName)
+    $preferred = @(
+        $htmlFiles |
+            Where-Object { $_.Name -match $topicRegex -or $_.FullName -match $topicRegex }
+    )
+
+    if ($preferred.Count -eq 0) {
+        $preferred = $htmlFiles
+    }
+
+    return ($preferred | Sort-Object -Property Length -Descending | Select-Object -First 1).FullName
+}
+
 function Shorten-Message {
     param(
         [string]$Text,
@@ -291,6 +324,7 @@ foreach ($entry in $topics) {
     $pdfPath = Join-Path -Path $outputPath -ChildPath ($safeName + ".pdf")
     $workDir = Join-Path -Path $tmpRoot -ChildPath $safeName
     $htmlPath = Join-Path -Path $workDir -ChildPath "page.html"
+    $assetsRoot = Join-Path -Path $workDir -ChildPath "assets"
 
     $encodedWeb = Encode-WebPath -WebPath $topic.WebPath
     $encodedTopic = [System.Uri]::EscapeDataString($topic.TopicName)
@@ -324,11 +358,6 @@ foreach ($entry in $topics) {
             "--trust-server-names",
             "--max-redirect=10",
             "--server-response",
-            "--page-requisites",
-            "--convert-links",
-            "--adjust-extension",
-            "--no-host-directories",
-            "--directory-prefix=$workDir",
             "--output-document=$htmlPath",
             $topicUrl
         )
@@ -356,13 +385,47 @@ foreach ($entry in $topics) {
             $lastError = "Downloaded HTML appears to be guest/placeholder content."
         }
         else {
+            # Second pass: fetch page requisites and rewrite links for reliable local rendering.
+            $assetError = ""
+            $assetArgs = @(
+                "--user=$Username",
+                "--password=$password",
+                "--content-disposition",
+                "--trust-server-names",
+                "--max-redirect=10",
+                "--server-response",
+                "--page-requisites",
+                "--convert-links",
+                "--adjust-extension",
+                "--no-host-directories",
+                "--directory-prefix=$assetsRoot",
+                $topicUrl
+            )
+
+            $oldEapAsset = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = "Continue"
+                $assetOutput = & $wgetExe @assetArgs 2>&1
+                $assetExit = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $oldEapAsset
+            }
+
+            if ($assetExit -ne 0) {
+                $assetError = ("Asset fetch warning (exit {0}): {1}" -f $assetExit, (Shorten-Message -Text ([string]::Join(" ", $assetOutput))))
+                Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message $assetError -Url $topicUrl
+            }
+
+            $htmlForPdf = Get-PreferredHtmlForConversion -SearchRoot $assetsRoot -TopicName $topic.TopicName -FallbackHtmlPath $htmlPath
+
             Write-Host ("[{0}/{1}] Converting HTML to PDF for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
 
             $wkArgs = @(
                 "--enable-local-file-access",
                 "--load-error-handling", "ignore",
                 "--load-media-error-handling", "ignore",
-                $htmlPath,
+                $htmlForPdf,
                 $pdfPath
             )
 
