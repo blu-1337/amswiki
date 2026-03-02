@@ -9,6 +9,8 @@ param(
     [string]$HtmlQueryString = "skin=plain;template=viewplain",
     [string]$WkhtmltopdfPath = "wkhtmltox/bin/wkhtmltopdf.exe",
     [int]$RetryCount = 1,
+    [ValidateRange(1, 16)]
+    [int]$MaxParallel = 1,
     [switch]$Overwrite,
     [switch]$KeepHtml,
     [switch]$SkipPlaceholderCheck,
@@ -331,6 +333,7 @@ Write-Host ("wget.exe      : {0}" -f $wgetExe)
 Write-Host ("wkhtmltopdf   : {0}" -f $wkhtmlExe)
 Write-Host ("Cookie jar    : {0}" -f $cookieJar)
 Write-Host ("RetryCount    : {0}" -f $RetryCount)
+Write-Host ("MaxParallel   : {0}" -f $MaxParallel)
 if ($SkipAssetMirror) {
     Write-Host "Asset mirror  : OFF (faster)"
 }
@@ -387,6 +390,7 @@ if (-not $NoSessionWarmup) {
 $ok = 0
 $skipped = 0
 $failed = 0
+$pendingConversions = New-Object System.Collections.Generic.List[object]
 
 foreach ($entry in $topics) {
     $topic = Parse-TopicEntry -Entry $entry -DefaultWeb $DefaultWeb
@@ -418,6 +422,7 @@ foreach ($entry in $topics) {
     }
 
     $done = $false
+    $queuedForParallel = $false
     $lastError = ""
 
     for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $done; $attempt++) {
@@ -498,47 +503,63 @@ foreach ($entry in $topics) {
                 $htmlForPdf = Get-PreferredHtmlForConversion -SearchRoot $assetsRoot -TopicName $topic.TopicName -FallbackHtmlPath $htmlPath
             }
 
-            Write-Host ("[{0}/{1}] Converting HTML to PDF for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
-
-            $wkArgs = @(
-                "--enable-local-file-access",
-                "--load-error-handling", "ignore",
-                "--load-media-error-handling", "ignore",
-                $htmlForPdf,
-                $pdfPath
-            )
-
-            $oldEap2 = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                $wkOutput = & $wkhtmlExe @wkArgs 2>&1
-                $wkExit = $LASTEXITCODE
-            }
-            finally {
-                $ErrorActionPreference = $oldEap2
-            }
-
-            if ($wkExit -ne 0) {
-                $lastError = ("wkhtmltopdf exit code {0}: {1}" -f $wkExit, (Shorten-Message -Text ([string]::Join(" ", $wkOutput))))
-            }
-            elseif (-not (Test-Path -LiteralPath $pdfPath)) {
-                $lastError = "PDF file was not created."
-            }
-            elseif ((Get-Item -LiteralPath $pdfPath).Length -eq 0) {
-                $lastError = "PDF file is empty."
-            }
-            elseif (-not (Test-PdfSignature -Path $pdfPath)) {
-                $lastError = "Generated file is not a valid PDF."
-            }
-            elseif (Test-IsPlaceholderPdf -Path $pdfPath) {
-                $lastError = "Generated PDF contains guest/placeholder content."
+            if ($MaxParallel -gt 1) {
+                [void]$pendingConversions.Add([pscustomobject]@{
+                    Topic = $entry
+                    Url = $topicUrl
+                    HtmlPath = $htmlForPdf
+                    PdfPath = $pdfPath
+                    WorkDir = $workDir
+                    SafeName = $safeName
+                })
+                $done = $true
+                $queuedForParallel = $true
+                Write-Host ("Queued conversion for {0}" -f $entry)
+                Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic $entry -Message "Queued for parallel PDF conversion." -Url $topicUrl
             }
             else {
-                $done = $true
-                $size = (Get-Item -LiteralPath $pdfPath).Length
-                Write-Host ("Saved PDF: {0}" -f $pdfPath)
-                Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $entry -Message ("Saved ({0} bytes)." -f $size) -Url $topicUrl
-                $ok++
+                Write-Host ("[{0}/{1}] Converting HTML to PDF for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
+
+                $wkArgs = @(
+                    "--enable-local-file-access",
+                    "--load-error-handling", "ignore",
+                    "--load-media-error-handling", "ignore",
+                    $htmlForPdf,
+                    $pdfPath
+                )
+
+                $oldEap2 = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = "Continue"
+                    $wkOutput = & $wkhtmlExe @wkArgs 2>&1
+                    $wkExit = $LASTEXITCODE
+                }
+                finally {
+                    $ErrorActionPreference = $oldEap2
+                }
+
+                if ($wkExit -ne 0) {
+                    $lastError = ("wkhtmltopdf exit code {0}: {1}" -f $wkExit, (Shorten-Message -Text ([string]::Join(" ", $wkOutput))))
+                }
+                elseif (-not (Test-Path -LiteralPath $pdfPath)) {
+                    $lastError = "PDF file was not created."
+                }
+                elseif ((Get-Item -LiteralPath $pdfPath).Length -eq 0) {
+                    $lastError = "PDF file is empty."
+                }
+                elseif (-not (Test-PdfSignature -Path $pdfPath)) {
+                    $lastError = "Generated file is not a valid PDF."
+                }
+                elseif (Test-IsPlaceholderPdf -Path $pdfPath) {
+                    $lastError = "Generated PDF contains guest/placeholder content."
+                }
+                else {
+                    $done = $true
+                    $size = (Get-Item -LiteralPath $pdfPath).Length
+                    Write-Host ("Saved PDF: {0}" -f $pdfPath)
+                    Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $entry -Message ("Saved ({0} bytes)." -f $size) -Url $topicUrl
+                    $ok++
+                }
             }
         }
 
@@ -552,7 +573,7 @@ foreach ($entry in $topics) {
         }
     }
 
-    if (-not $KeepHtml) {
+    if ((-not $KeepHtml) -and (-not $queuedForParallel)) {
         Remove-IfExists -Path $workDir
     }
 
@@ -561,6 +582,103 @@ foreach ($entry in $topics) {
         Write-RunLog -LogFile $downloadLog -Level "ERROR" -Topic $entry -Message $lastError -Url $topicUrl
         $failed++
     }
+}
+
+if (($MaxParallel -gt 1) -and ($pendingConversions.Count -gt 0)) {
+    Write-Host ""
+    Write-Host ("Starting parallel PDF conversion ({0} workers, {1} items)..." -f $MaxParallel, $pendingConversions.Count)
+    Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message ("PARALLEL_CONVERT_START workers={0} items={1}" -f $MaxParallel, $pendingConversions.Count)
+
+    $running = @()
+    $nextIndex = 0
+    $total = $pendingConversions.Count
+
+    while (($nextIndex -lt $total) -or ($running.Count -gt 0)) {
+        while (($running.Count -lt $MaxParallel) -and ($nextIndex -lt $total)) {
+            $task = $pendingConversions[$nextIndex]
+            $taskIdx = $nextIndex + 1
+            $nextIndex++
+
+            $jobBase = "{0:D5}_{1}" -f $taskIdx, ($task.SafeName -replace "[^A-Za-z0-9_.-]", "_")
+            $stdoutLog = Join-Path -Path $tmpRoot -ChildPath ("wkhtml_" + $jobBase + ".out.log")
+            $stderrLog = Join-Path -Path $tmpRoot -ChildPath ("wkhtml_" + $jobBase + ".err.log")
+            Remove-IfExists -Path $stdoutLog
+            Remove-IfExists -Path $stderrLog
+
+            $wkArgs = @(
+                "--enable-local-file-access",
+                "--load-error-handling", "ignore",
+                "--load-media-error-handling", "ignore",
+                $task.HtmlPath,
+                $task.PdfPath
+            )
+
+            $proc = Start-Process -FilePath $wkhtmlExe -ArgumentList $wkArgs -NoNewWindow -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+            $running += [pscustomobject]@{
+                Process = $proc
+                Task = $task
+                StdOut = $stdoutLog
+                StdErr = $stderrLog
+            }
+        }
+
+        $finished = @($running | Where-Object { $_.Process.HasExited })
+        if ($finished.Count -eq 0) {
+            Start-Sleep -Milliseconds 200
+            continue
+        }
+
+        foreach ($job in $finished) {
+            $err = ""
+            $processOutput = ""
+            if (Test-Path -LiteralPath $job.StdOut) {
+                $processOutput += [System.IO.File]::ReadAllText($job.StdOut)
+            }
+            if (Test-Path -LiteralPath $job.StdErr) {
+                $processOutput += " " + [System.IO.File]::ReadAllText($job.StdErr)
+            }
+
+            if ($job.Process.ExitCode -ne 0) {
+                $err = ("wkhtmltopdf exit code {0}: {1}" -f $job.Process.ExitCode, (Shorten-Message -Text $processOutput))
+            }
+            elseif (-not (Test-Path -LiteralPath $job.Task.PdfPath)) {
+                $err = "PDF file was not created."
+            }
+            elseif ((Get-Item -LiteralPath $job.Task.PdfPath).Length -eq 0) {
+                $err = "PDF file is empty."
+            }
+            elseif (-not (Test-PdfSignature -Path $job.Task.PdfPath)) {
+                $err = "Generated file is not a valid PDF."
+            }
+            elseif (Test-IsPlaceholderPdf -Path $job.Task.PdfPath) {
+                $err = "Generated PDF contains guest/placeholder content."
+            }
+
+            if ([string]::IsNullOrWhiteSpace($err)) {
+                $size = (Get-Item -LiteralPath $job.Task.PdfPath).Length
+                Write-Host ("Saved PDF: {0}" -f $job.Task.PdfPath)
+                Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $job.Task.Topic -Message ("Saved ({0} bytes)." -f $size) -Url $job.Task.Url
+                $ok++
+            }
+            else {
+                Write-Warning ("Failed to convert {0}. Error: {1}" -f $job.Task.Topic, $err)
+                Write-RunLog -LogFile $downloadLog -Level "ERROR" -Topic $job.Task.Topic -Message $err -Url $job.Task.Url
+                Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}`t{3}" -f (Get-Date -Format "s"), $job.Task.Topic, $err, $job.Task.Url)
+                $failed++
+            }
+
+            if (-not $KeepHtml) {
+                Remove-IfExists -Path $job.Task.WorkDir
+            }
+            Remove-IfExists -Path $job.StdOut
+            Remove-IfExists -Path $job.StdErr
+        }
+
+        $finishedIds = @($finished | ForEach-Object { $_.Process.Id })
+        $running = @($running | Where-Object { $finishedIds -notcontains $_.Process.Id })
+    }
+
+    Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message "PARALLEL_CONVERT_END"
 }
 
 $password = $null
