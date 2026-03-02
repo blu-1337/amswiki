@@ -20,6 +20,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# In PowerShell 7+, prevent native stderr (wget progress) from becoming terminating errors.
+$nativeErrPrefVar = Get-Variable -Name "PSNativeCommandUseErrorActionPreference" -ErrorAction SilentlyContinue
+if ($null -ne $nativeErrPrefVar) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
+
 function Resolve-AbsolutePath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -260,8 +266,17 @@ foreach ($entry in $topics) {
 
         $wgetArgs += $topicUrl
 
-        $wgetOutput = & $wgetExe @wgetArgs 2>&1
-        $exitCode = $LASTEXITCODE
+        $oldErrorActionPreference = $ErrorActionPreference
+        try {
+            # GNU wget writes progress/status to stderr even on success.
+            # Temporarily relax EAP so progress lines do not stop the script.
+            $ErrorActionPreference = "Continue"
+            $wgetOutput = & $wgetExe @wgetArgs 2>&1
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $oldErrorActionPreference
+        }
 
         if ($exitCode -ne 0) {
             $wgetMessage = ([string]::Join(" ", $wgetOutput)).Trim()
