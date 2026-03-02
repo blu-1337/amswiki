@@ -3,19 +3,21 @@
 param(
     [string]$Username = "g1hdmgs",
     [string]$DefaultWeb = "PPService",
-    [string]$BaseUrl = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
+    [string]$BaseViewAuthUrl = "https://ams-wiki.in.audi.vwg/wiki/bin/viewauth",
     [string]$TopicsFile = "topics.txt",
     [string]$OutputDir = "wiki_output",
-    [string]$QueryString = "skin=;",
+    [string]$HtmlQueryString = "skin=plain;template=viewplain",
+    [string]$WkhtmltopdfPath = "wkhtmltox/bin/wkhtmltopdf.exe",
     [int]$RetryCount = 2,
     [switch]$Overwrite,
+    [switch]$KeepHtml,
     [switch]$SkipPlaceholderCheck
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# PowerShell 7: don't convert native stderr progress to terminating errors.
+# PowerShell 7: native stderr can become non-terminating errors depending on preference.
 $nativeErrPrefVar = Get-Variable -Name "PSNativeCommandUseErrorActionPreference" -ErrorAction SilentlyContinue
 if ($null -ne $nativeErrPrefVar) {
     $PSNativeCommandUseErrorActionPreference = $false
@@ -37,7 +39,7 @@ function Resolve-AbsolutePath {
 function Remove-IfExists {
     param([string]$Path)
     if (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue
     }
 }
 
@@ -66,7 +68,6 @@ function Parse-TopicEntry {
 
     $webPath = $DefaultWeb.Trim("/")
     $topicName = $clean
-
     if ($clean.Contains("/")) {
         $idx = $clean.LastIndexOf("/")
         $candidateWeb = $clean.Substring(0, $idx).Trim("/")
@@ -82,7 +83,7 @@ function Parse-TopicEntry {
     }
 
     return [pscustomobject]@{
-        WebPath   = $webPath
+        WebPath = $webPath
         TopicName = $topicName
     }
 }
@@ -115,7 +116,7 @@ function Test-PdfSignature {
     return ([System.Text.Encoding]::ASCII.GetString($bytes, 0, 5) -eq "%PDF-")
 }
 
-function Test-IsPlaceholderPdf {
+function Test-IsPlaceholderText {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     if ($SkipPlaceholderCheck) {
@@ -126,7 +127,7 @@ function Test-IsPlaceholderPdf {
         return $false
     }
 
-    $maxBytes = 1048576
+    $maxBytes = 2097152
     $buffer = New-Object byte[] $maxBytes
     $stream = [System.IO.File]::OpenRead($Path)
     try {
@@ -140,16 +141,55 @@ function Test-IsPlaceholderPdf {
         return $false
     }
 
-    $content = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
-    $markers = @(
-        "Topic revision: 1970-01-01",
-        "WikiGuest",
-        "RENDERZONE{",
-        "This topic:"
+    $text = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
+    return ($text -like "*WikiGuest*" -and $text -like "*Topic revision: 1970-01-01*")
+}
+
+function Test-IsPlaceholderPdf {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if ($SkipPlaceholderCheck) {
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    $maxBytes = 2097152
+    $buffer = New-Object byte[] $maxBytes
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    if ($read -le 0) {
+        return $false
+    }
+
+    $text = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
+    return ($text -like "*WikiGuest*" -and $text -like "*Topic revision: 1970-01-01*")
+}
+
+function Shorten-Message {
+    param(
+        [string]$Text,
+        [int]$MaxLength = 1500
     )
 
-    $hitCount = @($markers | Where-Object { $content -like ("*" + $_ + "*") }).Count
-    return ($hitCount -ge 2)
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    $flat = ($Text -replace "\s+", " ").Trim()
+    if ($flat.Length -le $MaxLength) {
+        return $flat
+    }
+
+    return $flat.Substring(0, $MaxLength) + "...(truncated)"
 }
 
 function Write-RunLog {
@@ -168,10 +208,11 @@ function Write-RunLog {
 $scriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { (Get-Location).ProviderPath } else { $PSScriptRoot }
 $topicsPath = Resolve-AbsolutePath -Path $TopicsFile -BasePath $scriptDir
 $outputPath = Resolve-AbsolutePath -Path $OutputDir -BasePath $scriptDir
+$tmpRoot = Join-Path -Path $outputPath -ChildPath "_tmp"
 $downloadLog = Join-Path -Path $outputPath -ChildPath "wiki_download.log"
 $failedLog = Join-Path -Path $outputPath -ChildPath "wiki_failed.log"
-$base = $BaseUrl.TrimEnd("/")
-$query = if ([string]::IsNullOrWhiteSpace($QueryString)) { "" } else { "?" + $QueryString.TrimStart("?") }
+$base = $BaseViewAuthUrl.TrimEnd("/")
+$query = if ([string]::IsNullOrWhiteSpace($HtmlQueryString)) { "" } else { "?" + $HtmlQueryString.TrimStart("?") }
 
 if ([string]::IsNullOrWhiteSpace($Username)) {
     throw "Username is empty. Pass -Username explicitly."
@@ -179,7 +220,12 @@ if ([string]::IsNullOrWhiteSpace($Username)) {
 
 $wgetExe = Join-Path -Path $scriptDir -ChildPath "wget.exe"
 if (-not (Test-Path -LiteralPath $wgetExe)) {
-    throw ("wget.exe was not found next to wiki.ps1. Expected location: {0}" -f $wgetExe)
+    throw ("wget.exe was not found next to wiki.ps1. Expected: {0}" -f $wgetExe)
+}
+
+$wkhtmlExe = Resolve-AbsolutePath -Path $WkhtmltopdfPath -BasePath $scriptDir
+if (-not (Test-Path -LiteralPath $wkhtmlExe)) {
+    throw ("wkhtmltopdf.exe was not found. Expected: {0}" -f $wkhtmlExe)
 }
 
 if (-not (Test-Path -LiteralPath $topicsPath)) {
@@ -188,6 +234,9 @@ if (-not (Test-Path -LiteralPath $topicsPath)) {
 
 if (-not (Test-Path -LiteralPath $outputPath)) {
     New-Item -ItemType Directory -Path $outputPath | Out-Null
+}
+if (-not (Test-Path -LiteralPath $tmpRoot)) {
+    New-Item -ItemType Directory -Path $tmpRoot | Out-Null
 }
 
 if (-not (Test-Path -LiteralPath $downloadLog)) {
@@ -202,7 +251,7 @@ $topics = @(
 
 if ($topics.Count -eq 0) {
     Write-Warning ("No topics found in {0}" -f $topicsPath)
-    Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic "-" -Message "No topics found in topics file."
+    Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic "-" -Message "No topics found."
     exit 0
 }
 
@@ -212,15 +261,16 @@ if ([string]::IsNullOrWhiteSpace($password)) {
     throw "Empty password entered."
 }
 
-Write-Host "Starting bulk PDF export using GNU wget..."
-Write-Host ("Username   : {0}" -f $Username)
-Write-Host ("DefaultWeb : {0}" -f $DefaultWeb)
-Write-Host ("Base URL   : {0}" -f $base)
-Write-Host ("Topics file: {0}" -f $topicsPath)
-Write-Host ("Output dir : {0}" -f $outputPath)
-Write-Host ("wget.exe   : {0}" -f $wgetExe)
-Write-Host ("Log file   : {0}" -f $downloadLog)
-Write-Host ("Failed log : {0}" -f $failedLog)
+Write-Host "Starting HTML -> PDF wiki export..."
+Write-Host ("Username      : {0}" -f $Username)
+Write-Host ("Default web   : {0}" -f $DefaultWeb)
+Write-Host ("Base viewauth : {0}" -f $base)
+Write-Host ("Topics file   : {0}" -f $topicsPath)
+Write-Host ("Output dir    : {0}" -f $outputPath)
+Write-Host ("wget.exe      : {0}" -f $wgetExe)
+Write-Host ("wkhtmltopdf   : {0}" -f $wkhtmlExe)
+Write-Host ("Download log  : {0}" -f $downloadLog)
+Write-Host ("Failed log    : {0}" -f $failedLog)
 Write-Host ""
 
 Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message ("RUN_START topics={0}" -f $topics.Count)
@@ -230,42 +280,43 @@ $skipped = 0
 $failed = 0
 
 foreach ($entry in $topics) {
-    $topicParts = Parse-TopicEntry -Entry $entry -DefaultWeb $DefaultWeb
-    if ($null -eq $topicParts) {
-        Write-Warning ("Skipping invalid topics entry: {0}" -f $entry)
+    $topic = Parse-TopicEntry -Entry $entry -DefaultWeb $DefaultWeb
+    if ($null -eq $topic) {
+        Write-Warning ("Skipping invalid topic entry: {0}" -f $entry)
         Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message "Invalid topic line."
         continue
     }
 
-    $safeFileName = ($entry -replace "[\\/:*?`"<>|]", "_")
-    $pdfPath = Join-Path -Path $outputPath -ChildPath ($safeFileName + ".pdf")
-    $tmpPath = $pdfPath + ".download"
+    $safeName = ($entry -replace "[\\/:*?`"<>|]", "_")
+    $pdfPath = Join-Path -Path $outputPath -ChildPath ($safeName + ".pdf")
+    $workDir = Join-Path -Path $tmpRoot -ChildPath $safeName
+    $htmlPath = Join-Path -Path $workDir -ChildPath "page.html"
 
-    $encodedWeb = Encode-WebPath -WebPath $topicParts.WebPath
-    $encodedTopic = [System.Uri]::EscapeDataString($topicParts.TopicName)
+    $encodedWeb = Encode-WebPath -WebPath $topic.WebPath
+    $encodedTopic = [System.Uri]::EscapeDataString($topic.TopicName)
     $topicUrl = "{0}/{1}/{2}{3}" -f $base, $encodedWeb, $encodedTopic, $query
 
     if ((-not $Overwrite) -and (Test-Path -LiteralPath $pdfPath)) {
-        $existingSize = (Get-Item -LiteralPath $pdfPath).Length
-        if (($existingSize -gt 0) -and (Test-PdfSignature -Path $pdfPath) -and (-not (Test-IsPlaceholderPdf -Path $pdfPath))) {
+        $size = (Get-Item -LiteralPath $pdfPath).Length
+        if (($size -gt 0) -and (Test-PdfSignature -Path $pdfPath) -and (-not (Test-IsPlaceholderPdf -Path $pdfPath))) {
             Write-Host ("Skipping {0} (already downloaded)" -f $entry)
-            Write-RunLog -LogFile $downloadLog -Level "SKIP" -Topic $entry -Message ("Already exists ({0} bytes)." -f $existingSize) -Url $topicUrl
+            Write-RunLog -LogFile $downloadLog -Level "SKIP" -Topic $entry -Message ("Already exists ({0} bytes)." -f $size) -Url $topicUrl
             $skipped++
             continue
         }
-
         Remove-IfExists -Path $pdfPath
     }
 
-    $downloaded = $false
+    $done = $false
     $lastError = ""
 
-    for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $downloaded; $attempt++) {
-        Write-Host ("Downloading {0} ..." -f $entry)
-        Remove-IfExists -Path $tmpPath
+    for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $done; $attempt++) {
+        Remove-IfExists -Path $workDir
+        New-Item -ItemType Directory -Path $workDir | Out-Null
+        Remove-IfExists -Path $pdfPath
 
-        # Mirrors your working command pattern:
-        # wget --user=... --password=... --content-disposition --trust-server-names --max-redirect=10 --server-response -O file URL
+        Write-Host ("[{0}/{1}] Downloading HTML for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
+
         $wgetArgs = @(
             "--user=$Username",
             "--password=$password",
@@ -273,7 +324,12 @@ foreach ($entry in $topics) {
             "--trust-server-names",
             "--max-redirect=10",
             "--server-response",
-            "--output-document=$tmpPath",
+            "--page-requisites",
+            "--convert-links",
+            "--adjust-extension",
+            "--no-host-directories",
+            "--directory-prefix=$workDir",
+            "--output-document=$htmlPath",
             $topicUrl
         )
 
@@ -281,68 +337,105 @@ foreach ($entry in $topics) {
         try {
             $ErrorActionPreference = "Continue"
             $wgetOutput = & $wgetExe @wgetArgs 2>&1
-            $exitCode = $LASTEXITCODE
+            $wgetExit = $LASTEXITCODE
         }
         finally {
             $ErrorActionPreference = $oldEap
         }
 
-        if ($exitCode -ne 0) {
-            $wgetMessage = ([string]::Join(" ", $wgetOutput)).Trim()
-            if ([string]::IsNullOrWhiteSpace($wgetMessage)) {
-                $lastError = ("wget exit code {0}" -f $exitCode)
-            }
-            else {
-                $lastError = ("wget exit code {0}: {1}" -f $exitCode, $wgetMessage)
-            }
+        if ($wgetExit -ne 0) {
+            $lastError = ("wget exit code {0}: {1}" -f $wgetExit, (Shorten-Message -Text ([string]::Join(" ", $wgetOutput))))
         }
-        elseif (-not (Test-Path -LiteralPath $tmpPath)) {
-            $lastError = "Output file was not created."
+        elseif (-not (Test-Path -LiteralPath $htmlPath)) {
+            $lastError = "HTML file was not created."
         }
-        elseif ((Get-Item -LiteralPath $tmpPath).Length -eq 0) {
-            $lastError = "Downloaded file is empty."
+        elseif ((Get-Item -LiteralPath $htmlPath).Length -eq 0) {
+            $lastError = "HTML file is empty."
         }
-        elseif (-not (Test-PdfSignature -Path $tmpPath)) {
-            $lastError = "Downloaded file is not a valid PDF."
-        }
-        elseif (Test-IsPlaceholderPdf -Path $tmpPath) {
-            $lastError = "Downloaded PDF contains placeholder/guest content."
+        elseif (Test-IsPlaceholderText -Path $htmlPath) {
+            $lastError = "Downloaded HTML appears to be guest/placeholder content."
         }
         else {
-            Move-Item -LiteralPath $tmpPath -Destination $pdfPath -Force
-            $size = (Get-Item -LiteralPath $pdfPath).Length
-            Write-Host ("Saved PDF: {0}" -f $pdfPath)
-            Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $entry -Message ("Saved ({0} bytes)." -f $size) -Url $topicUrl
-            $downloaded = $true
-            $ok++
+            Write-Host ("[{0}/{1}] Converting HTML to PDF for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
+
+            $wkArgs = @(
+                "--enable-local-file-access",
+                "--load-error-handling", "ignore",
+                "--load-media-error-handling", "ignore",
+                $htmlPath,
+                $pdfPath
+            )
+
+            $oldEap2 = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = "Continue"
+                $wkOutput = & $wkhtmlExe @wkArgs 2>&1
+                $wkExit = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $oldEap2
+            }
+
+            if ($wkExit -ne 0) {
+                $lastError = ("wkhtmltopdf exit code {0}: {1}" -f $wkExit, (Shorten-Message -Text ([string]::Join(" ", $wkOutput))))
+            }
+            elseif (-not (Test-Path -LiteralPath $pdfPath)) {
+                $lastError = "PDF file was not created."
+            }
+            elseif ((Get-Item -LiteralPath $pdfPath).Length -eq 0) {
+                $lastError = "PDF file is empty."
+            }
+            elseif (-not (Test-PdfSignature -Path $pdfPath)) {
+                $lastError = "Generated file is not a valid PDF."
+            }
+            elseif (Test-IsPlaceholderPdf -Path $pdfPath) {
+                $lastError = "Generated PDF contains guest/placeholder content."
+            }
+            else {
+                $done = $true
+                $size = (Get-Item -LiteralPath $pdfPath).Length
+                Write-Host ("Saved PDF: {0}" -f $pdfPath)
+                Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $entry -Message ("Saved ({0} bytes)." -f $size) -Url $topicUrl
+                $ok++
+            }
         }
 
-        if (-not $downloaded) {
-            Remove-IfExists -Path $tmpPath
+        if (-not $done) {
+            Write-Warning ("Attempt {0} failed for {1}: {2}" -f $attempt, $entry, $lastError)
+            Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message ("Attempt {0}: {1}" -f $attempt, $lastError) -Url $topicUrl
+
             if ($attempt -lt ($RetryCount + 1)) {
-                Write-Warning ("Attempt {0} failed for {1}. Retrying..." -f $attempt, $entry)
-                Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message ("Attempt {0} failed: {1}" -f $attempt, $lastError) -Url $topicUrl
                 Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
             }
         }
     }
 
-    if (-not $downloaded) {
-        Write-Warning ("Failed to download {0}. Error: {1}" -f $entry, $lastError)
-        Write-RunLog -LogFile $downloadLog -Level "ERROR" -Topic $entry -Message $lastError -Url $topicUrl
+    if (-not $KeepHtml) {
+        Remove-IfExists -Path $workDir
+    }
+
+    if (-not $done) {
         Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}`t{3}" -f (Get-Date -Format "s"), $entry, $lastError, $topicUrl)
+        Write-RunLog -LogFile $downloadLog -Level "ERROR" -Topic $entry -Message $lastError -Url $topicUrl
         $failed++
     }
 }
 
 $password = $null
+if ((Test-Path -LiteralPath $tmpRoot) -and (-not $KeepHtml)) {
+    # Clean temp root if empty after successful cleanup.
+    $leftovers = @(Get-ChildItem -LiteralPath $tmpRoot -Force -ErrorAction SilentlyContinue)
+    if ($leftovers.Count -eq 0) {
+        Remove-IfExists -Path $tmpRoot
+    }
+}
 
 Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message ("RUN_END ok={0} skipped={1} failed={2}" -f $ok, $skipped, $failed)
 
 Write-Host ""
 Write-Host "Done."
 Write-Host ("Successful: {0}  Skipped: {1}  Failed: {2}" -f $ok, $skipped, $failed)
-Write-Host ("Run log    : {0}" -f $downloadLog)
+Write-Host ("Run log   : {0}" -f $downloadLog)
 if ($failed -gt 0) {
-    Write-Host ("Failed log : {0}" -f $failedLog)
+    Write-Host ("Failed log: {0}" -f $failedLog)
 }
