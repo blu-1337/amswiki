@@ -1,10 +1,11 @@
 # ==============================================
 # wiki.ps1 - Bulk export Foswiki topics to PDF
-# Works with PowerShell 5+ and 7+ using curl negotiate auth
+# Works with PowerShell 5+ and 7+, using curl NTLM auth
 # ==============================================
 
 [CmdletBinding()]
 param(
+    [string]$Username = $env:USERNAME,                        # Example: g1hdmgs or DOMAIN\g1hdmgs
     [string]$BaseWeb = "System",
     [string]$BaseURL = "https://ams-wiki.in.audi.vwg/wiki/bin/genpdf",
     [string]$TopicsFile = "topics.txt",
@@ -12,7 +13,7 @@ param(
     [string]$QueryString = "skin=;",
     [int]$RetryCount = 2,
     [switch]$Overwrite,
-    [switch]$SkipContentValidation
+    [switch]$SkipPlaceholderCheck
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +32,14 @@ function Resolve-AbsolutePath {
     return [System.IO.Path]::GetFullPath((Join-Path -Path $BasePath -ChildPath $Path))
 }
 
-function Test-IsPdf {
+function Remove-IfExists {
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-PdfSignature {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -51,13 +59,18 @@ function Test-IsPdf {
         return $false
     }
 
-    return ([System.Text.Encoding]::ASCII.GetString($bytes, 0, 5) -eq "%PDF-")
+    $header = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 5)
+    return ($header -eq "%PDF-")
 }
 
 function Test-IsGuestPlaceholderPdf {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    if ($SkipContentValidation) {
+    if ($SkipPlaceholderCheck) {
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
         return $false
     }
 
@@ -75,23 +88,51 @@ function Test-IsGuestPlaceholderPdf {
         return $false
     }
 
-    $snippet = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
+    $content = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
     $markers = @(
         "Topic revision: 1970-01-01",
         "WikiGuest",
         "RENDERZONE{",
         "This topic:"
     )
-
-    $hitCount = @($markers | Where-Object { $snippet -like ("*" + $_ + "*") }).Count
+    $hitCount = @($markers | Where-Object { $content -like ("*" + $_ + "*") }).Count
     return ($hitCount -ge 2)
 }
 
-function Remove-IfExists {
-    param([string]$Path)
-    if (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+function Split-TopicEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Entry,
+        [Parameter(Mandatory = $true)][string]$DefaultWeb
+    )
+
+    $clean = $Entry.Trim().Trim("/")
+    if (-not $clean) {
+        return $null
     }
+
+    if ($clean.Contains("/")) {
+        $idx = $clean.LastIndexOf("/")
+        $webPath = $clean.Substring(0, $idx).Trim("/")
+        $topicName = $clean.Substring($idx + 1).Trim("/")
+    }
+    else {
+        $webPath = $DefaultWeb.Trim("/")
+        $topicName = $clean
+    }
+
+    if ([string]::IsNullOrWhiteSpace($webPath) -or [string]::IsNullOrWhiteSpace($topicName)) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        WebPath   = $webPath
+        TopicName = $topicName
+    }
+}
+
+function Encode-WebPath {
+    param([Parameter(Mandatory = $true)][string]$WebPath)
+    return (($WebPath -split "/") | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join "/"
 }
 
 $scriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { (Get-Location).ProviderPath } else { $PSScriptRoot }
@@ -101,9 +142,13 @@ $failedLog = Join-Path -Path $outputPath -ChildPath "wiki_failed.log"
 $base = $BaseURL.TrimEnd("/")
 $query = if ([string]::IsNullOrWhiteSpace($QueryString)) { "" } else { "?" + $QueryString.TrimStart("?") }
 
+if ([string]::IsNullOrWhiteSpace($Username)) {
+    throw "Username is empty. Pass -Username explicitly (example: -Username g1hdmgs)."
+}
+
 $curlCmd = Get-Command curl.exe -ErrorAction SilentlyContinue
 if ($null -eq $curlCmd) {
-    throw "curl.exe was not found. Please use Windows with curl.exe available."
+    throw "curl.exe was not found. Install curl or run on Windows with curl available."
 }
 $curlExe = $curlCmd.Source
 
@@ -119,7 +164,13 @@ $topics = Get-Content -LiteralPath $topicsPath |
     ForEach-Object { $_.Trim() } |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
 
-Write-Host "Starting bulk PDF export using Windows session authentication..."
+if ($topics.Count -eq 0) {
+    Write-Warning ("No topics found in {0}" -f $topicsPath)
+    exit 0
+}
+
+Write-Host "Starting bulk PDF export using NTLM authentication..."
+Write-Host ("Username   : {0}" -f $Username)
 Write-Host ("Base URL   : {0}" -f $base)
 Write-Host ("Base Web   : {0}" -f $BaseWeb)
 Write-Host ("Topics file: {0}" -f $topicsPath)
@@ -130,43 +181,50 @@ $ok = 0
 $skipped = 0
 $failed = 0
 
-foreach ($topic in $topics) {
-    if ([string]::IsNullOrWhiteSpace($topic)) { continue }
+foreach ($entry in $topics) {
+    $parts = Split-TopicEntry -Entry $entry -DefaultWeb $BaseWeb
+    if ($null -eq $parts) {
+        Write-Warning ("Skipping invalid topics entry: {0}" -f $entry)
+        continue
+    }
 
-    $topicPath = if ($topic -match "/") { $topic.Trim("/") } else { "{0}/{1}" -f $BaseWeb.Trim("/"), $topic.Trim("/") }
-    $encodedPath = (($topicPath -split "/") | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join "/"
-    $topicUrl = "{0}/{1}{2}" -f $base, $encodedPath, $query
-
-    $safeFileName = $topic -replace "[\\/:*?`"<>|]", "_"
+    $safeFileName = ($entry -replace "[\\/:*?`"<>|]", "_")
     $pdfPath = Join-Path -Path $outputPath -ChildPath ($safeFileName + ".pdf")
     $tmpPath = $pdfPath + ".download"
 
     if ((-not $Overwrite) -and (Test-Path -LiteralPath $pdfPath)) {
-        $existingSize = (Get-Item -LiteralPath $pdfPath).Length
-        if (($existingSize -gt 0) -and (Test-IsPdf -Path $pdfPath) -and (-not (Test-IsGuestPlaceholderPdf -Path $pdfPath))) {
-            Write-Host ("Skipping {0} (already downloaded)" -f $topic)
+        $size = (Get-Item -LiteralPath $pdfPath).Length
+        if (($size -gt 0) -and (Test-PdfSignature -Path $pdfPath) -and (-not (Test-IsGuestPlaceholderPdf -Path $pdfPath))) {
+            Write-Host ("Skipping {0} (already downloaded)" -f $entry)
             $skipped++
             continue
         }
+
         Remove-IfExists -Path $pdfPath
     }
+
+    $encodedWeb = Encode-WebPath -WebPath $parts.WebPath
+    $encodedTopic = [System.Uri]::EscapeDataString($parts.TopicName)
+    $topicUrl = "{0}/{1}/{2}{3}" -f $base, $encodedWeb, $encodedTopic, $query
 
     $downloaded = $false
     $lastError = ""
 
     for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $downloaded; $attempt++) {
-        Write-Host ("Downloading {0} ..." -f $topic)
+        Write-Host ("Downloading {0} ..." -f $entry)
         Remove-IfExists -Path $tmpPath
 
+        # Intentionally mirrors your proven working command:
+        # curl --ntlm -u <username> "<url>" -o <file>
         $curlArgs = @(
-            "--negotiate",
-            "-u", ":",
+            "--ntlm",
+            "-u", $Username,
             "--location",
             "--silent",
             "--show-error",
             "--fail",
-            "--output", $tmpPath,
-            $topicUrl
+            $topicUrl,
+            "-o", $tmpPath
         )
 
         $curlOutput = & $curlExe @curlArgs 2>&1
@@ -182,13 +240,13 @@ foreach ($topic in $topics) {
             }
         }
         elseif (-not (Test-Path -LiteralPath $tmpPath)) {
-            $lastError = "Downloaded file was not created."
+            $lastError = "Output file was not created."
         }
         elseif ((Get-Item -LiteralPath $tmpPath).Length -eq 0) {
             $lastError = "Downloaded file is empty."
         }
-        elseif (-not (Test-IsPdf -Path $tmpPath)) {
-            $lastError = "Downloaded file is not a PDF."
+        elseif (-not (Test-PdfSignature -Path $tmpPath)) {
+            $lastError = "Downloaded file is not a valid PDF."
         }
         elseif (Test-IsGuestPlaceholderPdf -Path $tmpPath) {
             $lastError = "Downloaded PDF contains guest/placeholder content."
@@ -202,15 +260,15 @@ foreach ($topic in $topics) {
         if (-not $downloaded) {
             Remove-IfExists -Path $tmpPath
             if ($attempt -lt ($RetryCount + 1)) {
-                Write-Warning ("Attempt {0} failed for {1}. Retrying..." -f $attempt, $topic)
+                Write-Warning ("Attempt {0} failed for {1}. Retrying..." -f $attempt, $entry)
                 Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
             }
         }
     }
 
     if (-not $downloaded) {
-        Write-Warning ("Failed to download {0}. Error: {1}" -f $topic, $lastError)
-        Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}`t{3}" -f (Get-Date -Format "s"), $topic, $lastError, $topicUrl)
+        Write-Warning ("Failed to download {0}. Error: {1}" -f $entry, $lastError)
+        Add-Content -LiteralPath $failedLog -Value ("{0}`t{1}`t{2}`t{3}" -f (Get-Date -Format "s"), $entry, $lastError, $topicUrl)
         $failed++
     }
 }
