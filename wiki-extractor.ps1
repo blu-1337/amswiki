@@ -12,6 +12,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Resolve-AbsolutePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$BasePath
+    )
+
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path -Path $BasePath -ChildPath $Path))
+}
+
 function Get-SafeFileName {
     param(
         [Parameter(Mandatory = $true)]
@@ -38,12 +53,14 @@ function Test-IsPdfFile {
         [string]$Path
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+
+    if (-not (Test-Path -LiteralPath $fullPath)) {
         return $false
     }
 
     $bytes = New-Object byte[] 5
-    $stream = [System.IO.File]::OpenRead($Path)
+    $stream = [System.IO.File]::OpenRead($fullPath)
     try {
         $read = $stream.Read($bytes, 0, $bytes.Length)
     }
@@ -58,6 +75,10 @@ function Test-IsPdfFile {
     $header = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 5)
     return $header -eq "%PDF-"
 }
+
+$scriptBase = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { (Get-Location).ProviderPath }
+$TopicsFile = Resolve-AbsolutePath -Path $TopicsFile -BasePath $scriptBase
+$OutputDir = Resolve-AbsolutePath -Path $OutputDir -BasePath $scriptBase
 
 if (-not (Test-Path -LiteralPath $TopicsFile)) {
     throw "Topics file not found: $TopicsFile"
@@ -83,6 +104,7 @@ $failed = 0
 $base = $BaseURL.TrimEnd("/")
 
 Write-Host "Starting bulk PDF export..."
+Write-Host "Script dir : $scriptBase"
 Write-Host "Base URL   : $base"
 Write-Host "Topics file: $TopicsFile"
 Write-Host "Output dir : $OutputDir"
@@ -122,6 +144,7 @@ foreach ($topic in $topics) {
                 -Uri $uri `
                 -OutFile $outFile `
                 -UseDefaultCredentials `
+                -UseBasicParsing `
                 -MaximumRedirection 5 `
                 -ErrorAction Stop | Out-Null
 
