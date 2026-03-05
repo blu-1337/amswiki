@@ -2,24 +2,23 @@
 [CmdletBinding()]
 param(
     [string]$Username = "g1hdmgs",
-    [string]$DefaultWeb = "PPService",
-    [string]$BaseViewAuthUrl = "https://ams-wiki.in.audi.vwg/wiki/bin/viewauth",
+    [string]$DefaultWeb = "HPC",
+    [string]$BaseViewAuthUrl = "https://hpc-wiki.in.audi.vwg/wiki/bin/viewauth",
     [string]$TopicsFile = "topics.txt",
     [string]$OutputDir = "wiki_output",
-    [string]$HtmlQueryString = "skin=plain;template=viewplain",
+    [string]$HtmlQueryString = "",
     [int]$RetryCount = 1,
     [switch]$Overwrite,
     [switch]$SkipPlaceholderCheck,
-    [switch]$ShowServerResponse,
-    [switch]$NoSessionWarmup,
-    [switch]$DownloadAssets,
-    [switch]$KeepWorkDir
+    [bool]$UseAskPassword = $true,
+    [string]$Password = "",
+    [bool]$ShowServerResponse = $true,
+    [bool]$KeepWorkDir = $true
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# PowerShell 7: avoid stderr from native tools becoming terminating errors.
 $nativeErrPrefVar = Get-Variable -Name "PSNativeCommandUseErrorActionPreference" -ErrorAction SilentlyContinue
 if ($null -ne $nativeErrPrefVar) {
     $PSNativeCommandUseErrorActionPreference = $false
@@ -47,7 +46,6 @@ function Remove-IfExists {
 
 function Convert-SecureStringToPlainText {
     param([Parameter(Mandatory = $true)][Security.SecureString]$SecureString)
-
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
     try {
         return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
@@ -85,7 +83,7 @@ function Parse-TopicEntry {
     }
 
     return [pscustomobject]@{
-        WebPath   = $webPath
+        WebPath = $webPath
         TopicName = $topicName
     }
 }
@@ -104,7 +102,6 @@ function Test-IsPlaceholderText {
     if ($SkipCheck) {
         return $false
     }
-
     if (-not (Test-Path -LiteralPath $Path)) {
         return $false
     }
@@ -128,11 +125,7 @@ function Test-IsPlaceholderText {
 }
 
 function Shorten-Message {
-    param(
-        [string]$Text,
-        [int]$MaxLength = 1500
-    )
-
+    param([string]$Text, [int]$MaxLength = 1500)
     if ([string]::IsNullOrWhiteSpace($Text)) {
         return ""
     }
@@ -141,7 +134,6 @@ function Shorten-Message {
     if ($flat.Length -le $MaxLength) {
         return $flat
     }
-
     return $flat.Substring(0, $MaxLength) + "...(truncated)"
 }
 
@@ -153,7 +145,6 @@ function Write-RunLog {
         [Parameter(Mandatory = $true)][string]$Message,
         [string]$Url = ""
     )
-
     $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f (Get-Date -Format "s"), $Level, $Topic, $Message, $Url
     Add-Content -LiteralPath $LogFile -Value $line
 }
@@ -176,19 +167,18 @@ function Invoke-WgetCommand {
 
     return [pscustomobject]@{
         ExitCode = $exitCode
-        Output   = $output
+        Output = $output
     }
 }
 
 function Get-PreferredHtmlFile {
     param(
         [Parameter(Mandatory = $true)][string]$SearchRoot,
-        [Parameter(Mandatory = $true)][string]$TopicName,
-        [Parameter(Mandatory = $true)][string]$FallbackHtmlPath
+        [Parameter(Mandatory = $true)][string]$TopicName
     )
 
     if (-not (Test-Path -LiteralPath $SearchRoot)) {
-        return $FallbackHtmlPath
+        return $null
     }
 
     $htmlFiles = @(
@@ -197,7 +187,7 @@ function Get-PreferredHtmlFile {
     )
 
     if ($htmlFiles.Count -eq 0) {
-        return $FallbackHtmlPath
+        return $null
     }
 
     $topicRegex = [Regex]::Escape($TopicName)
@@ -256,72 +246,33 @@ if ($topics.Count -eq 0) {
     exit 0
 }
 
-$securePassword = Read-Host ("Password for user {0}" -f $Username) -AsSecureString
-$password = Convert-SecureStringToPlainText -SecureString $securePassword
-if ([string]::IsNullOrWhiteSpace($password)) {
-    throw "Empty password entered."
+if (-not $UseAskPassword) {
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        $securePassword = Read-Host ("Password for user {0}" -f $Username) -AsSecureString
+        $Password = Convert-SecureStringToPlainText -SecureString $securePassword
+    }
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        throw "Empty password entered."
+    }
 }
 
-Write-Host "Starting HTML wiki export..."
-Write-Host ("Username      : {0}" -f $Username)
-Write-Host ("Default web   : {0}" -f $DefaultWeb)
-Write-Host ("Base viewauth : {0}" -f $base)
-Write-Host ("Topics file   : {0}" -f $topicsPath)
-Write-Host ("Output dir    : {0}" -f $outputPath)
-Write-Host ("wget.exe      : {0}" -f $wgetExe)
-Write-Host ("Cookie jar    : {0}" -f $cookieJar)
-Write-Host ("RetryCount    : {0}" -f $RetryCount)
-if ($DownloadAssets) {
-    Write-Host "Download assets: ON"
-}
-else {
-    Write-Host "Download assets: OFF (faster)"
-}
-if ($NoSessionWarmup) {
-    Write-Host "Session warmup : OFF"
-}
-else {
-    Write-Host "Session warmup : ON"
-}
-Write-Host ("Download log   : {0}" -f $downloadLog)
-Write-Host ("Failed log     : {0}" -f $failedLog)
+Write-Host "Starting HTML wiki export (wget mirror-style)..."
+Write-Host ("Username         : {0}" -f $Username)
+Write-Host ("Default web      : {0}" -f $DefaultWeb)
+Write-Host ("Base viewauth    : {0}" -f $base)
+Write-Host ("Topics file      : {0}" -f $topicsPath)
+Write-Host ("Output dir       : {0}" -f $outputPath)
+Write-Host ("wget.exe         : {0}" -f $wgetExe)
+Write-Host ("Cookie jar       : {0}" -f $cookieJar)
+Write-Host ("RetryCount       : {0}" -f $RetryCount)
+Write-Host ("UseAskPassword   : {0}" -f $UseAskPassword)
+Write-Host ("ShowServerResp   : {0}" -f $ShowServerResponse)
+Write-Host ("KeepWorkDir      : {0}" -f $KeepWorkDir)
+Write-Host ("Download log     : {0}" -f $downloadLog)
+Write-Host ("Failed log       : {0}" -f $failedLog)
 Write-Host ""
 
 Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message ("RUN_START topics={0}" -f $topics.Count)
-
-$warmupTopicUrl = "{0}/{1}/WebHome{2}" -f $base, (Encode-WebPath -WebPath $DefaultWeb), $query
-if (-not $NoSessionWarmup) {
-    $warmupHtml = Join-Path -Path $tmpRoot -ChildPath "_warmup.html"
-    Remove-IfExists -Path $warmupHtml
-
-    $warmupArgs = @(
-        "--user=$Username",
-        "--password=$password",
-        "--max-redirect=10",
-        "--auth-no-challenge",
-        "--keep-session-cookies",
-        "--save-cookies=$cookieJar",
-        "--output-document=$warmupHtml"
-    )
-    if (Test-Path -LiteralPath $cookieJar) {
-        $warmupArgs += "--load-cookies=$cookieJar"
-    }
-    if ($ShowServerResponse) {
-        $warmupArgs += "--server-response"
-    }
-    $warmupArgs += $warmupTopicUrl
-
-    $warmupResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $warmupArgs
-    if ($warmupResult.ExitCode -eq 0) {
-        Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message "Session warmup succeeded." -Url $warmupTopicUrl
-    }
-    else {
-        $warmMsg = ("Warmup exit code {0}: {1}" -f $warmupResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $warmupResult.Output))))
-        Write-Warning $warmMsg
-        Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic "-" -Message $warmMsg -Url $warmupTopicUrl
-    }
-    Remove-IfExists -Path $warmupHtml
-}
 
 $ok = 0
 $skipped = 0
@@ -338,18 +289,16 @@ foreach ($entry in $topics) {
     $safeName = ($entry -replace "[\\/:*?`"<>|]", "_")
     $finalHtmlPath = Join-Path -Path $outputPath -ChildPath ($safeName + ".html")
     $workDir = Join-Path -Path $tmpRoot -ChildPath $safeName
-    $mainHtmlPath = Join-Path -Path $workDir -ChildPath "page.html"
-    $assetsRoot = Join-Path -Path $workDir -ChildPath "assets"
 
     $encodedWeb = Encode-WebPath -WebPath $topic.WebPath
     $encodedTopic = [System.Uri]::EscapeDataString($topic.TopicName)
     $topicUrl = "{0}/{1}/{2}{3}" -f $base, $encodedWeb, $encodedTopic, $query
 
     if ((-not $Overwrite) -and (Test-Path -LiteralPath $finalHtmlPath)) {
-        $size = (Get-Item -LiteralPath $finalHtmlPath).Length
-        if (($size -gt 0) -and (-not (Test-IsPlaceholderText -Path $finalHtmlPath -SkipCheck:$SkipPlaceholderCheck))) {
+        $existingSize = (Get-Item -LiteralPath $finalHtmlPath).Length
+        if (($existingSize -gt 0) -and (-not (Test-IsPlaceholderText -Path $finalHtmlPath -SkipCheck:$SkipPlaceholderCheck))) {
             Write-Host ("Skipping {0} (already downloaded)" -f $entry)
-            Write-RunLog -LogFile $downloadLog -Level "SKIP" -Topic $entry -Message ("Already exists ({0} bytes)." -f $size) -Url $topicUrl
+            Write-RunLog -LogFile $downloadLog -Level "SKIP" -Topic $entry -Message ("Already exists ({0} bytes)." -f $existingSize) -Url $topicUrl
             $skipped++
             continue
         }
@@ -366,81 +315,48 @@ foreach ($entry in $topics) {
 
         Write-Host ("[{0}/{1}] Downloading HTML for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
 
-        $mainArgs = @(
+        # Mirrors the user-provided successful one-liner style, but in per-topic directories.
+        $wgetArgs = @(
             "--user=$Username",
-            "--password=$password",
             "--content-disposition",
             "--trust-server-names",
             "--max-redirect=10",
             "--auth-no-challenge",
             "--keep-session-cookies",
             "--save-cookies=$cookieJar",
-            "--output-document=$mainHtmlPath",
-            $topicUrl
+            "--load-cookies=$cookieJar",
+            "--page-requisites",
+            "--convert-links",
+            "--adjust-extension",
+            "--span-hosts",
+            "--no-host-directories",
+            "--directory-prefix=$workDir"
         )
-        if (Test-Path -LiteralPath $cookieJar) {
-            $mainArgs += "--load-cookies=$cookieJar"
-        }
-        if ($ShowServerResponse) {
-            $mainArgs += "--server-response"
-        }
-
-        $mainResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $mainArgs
-        if ($mainResult.ExitCode -ne 0) {
-            $lastError = ("wget exit code {0}: {1}" -f $mainResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $mainResult.Output))))
-        }
-        elseif (-not (Test-Path -LiteralPath $mainHtmlPath)) {
-            $lastError = "HTML file was not created."
-        }
-        elseif ((Get-Item -LiteralPath $mainHtmlPath).Length -eq 0) {
-            $lastError = "HTML file is empty."
-        }
-        elseif (Test-IsPlaceholderText -Path $mainHtmlPath -SkipCheck:$SkipPlaceholderCheck) {
-            $lastError = "Downloaded HTML appears to be guest/placeholder content."
+        if ($UseAskPassword) {
+            $wgetArgs += "--ask-password"
         }
         else {
-            $htmlToKeep = $mainHtmlPath
+            $wgetArgs += "--password=$Password"
+        }
+        if ($ShowServerResponse) {
+            $wgetArgs += "--server-response"
+        }
+        $wgetArgs += $topicUrl
 
-            if ($DownloadAssets) {
-                $assetArgs = @(
-                    "--user=$Username",
-                    "--password=$password",
-                    "--content-disposition",
-                    "--trust-server-names",
-                    "--max-redirect=10",
-                    "--auth-no-challenge",
-                    "--keep-session-cookies",
-                    "--save-cookies=$cookieJar",
-                    "--page-requisites",
-                    "--convert-links",
-                    "--adjust-extension",
-                    "--no-host-directories",
-                    "--directory-prefix=$assetsRoot",
-                    $topicUrl
-                )
-                if (Test-Path -LiteralPath $cookieJar) {
-                    $assetArgs += "--load-cookies=$cookieJar"
-                }
-                if ($ShowServerResponse) {
-                    $assetArgs += "--server-response"
-                }
-
-                $assetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $assetArgs
-                if ($assetResult.ExitCode -ne 0) {
-                    $assetMsg = ("Asset fetch warning (exit {0}): {1}" -f $assetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $assetResult.Output))))
-                    Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message $assetMsg -Url $topicUrl
-                }
-
-                $htmlToKeep = Get-PreferredHtmlFile -SearchRoot $assetsRoot -TopicName $topic.TopicName -FallbackHtmlPath $mainHtmlPath
-            }
-
-            if (-not (Test-Path -LiteralPath $htmlToKeep)) {
-                $lastError = "Final HTML source file is missing."
+        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs
+        if ($wgetResult.ExitCode -ne 0) {
+            $lastError = ("wget exit code {0}: {1}" -f $wgetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $wgetResult.Output))))
+        }
+        else {
+            $htmlCandidate = Get-PreferredHtmlFile -SearchRoot $workDir -TopicName $topic.TopicName
+            if ([string]::IsNullOrWhiteSpace($htmlCandidate)) {
+                $lastError = "Could not find downloaded HTML file in work directory."
             }
             else {
-                Copy-Item -LiteralPath $htmlToKeep -Destination $finalHtmlPath -Force
+                Copy-Item -LiteralPath $htmlCandidate -Destination $finalHtmlPath -Force
+
                 if (-not (Test-Path -LiteralPath $finalHtmlPath)) {
-                    $lastError = "Failed to create final HTML file."
+                    $lastError = "Final HTML file was not created."
                 }
                 elseif ((Get-Item -LiteralPath $finalHtmlPath).Length -eq 0) {
                     $lastError = "Final HTML file is empty."
@@ -452,8 +368,8 @@ foreach ($entry in $topics) {
                     $size = (Get-Item -LiteralPath $finalHtmlPath).Length
                     Write-Host ("Saved HTML: {0}" -f $finalHtmlPath)
                     Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $entry -Message ("Saved ({0} bytes)." -f $size) -Url $topicUrl
-                    $ok++
                     $done = $true
+                    $ok++
                 }
             }
         }
@@ -478,7 +394,7 @@ foreach ($entry in $topics) {
     }
 }
 
-$password = $null
+$Password = ""
 if ((Test-Path -LiteralPath $tmpRoot) -and (-not $KeepWorkDir)) {
     $leftovers = @(Get-ChildItem -LiteralPath $tmpRoot -Force -ErrorAction SilentlyContinue)
     if ($leftovers.Count -eq 0) {
