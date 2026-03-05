@@ -11,6 +11,7 @@ param(
     [switch]$Overwrite,
     [switch]$SkipPlaceholderCheck,
     [bool]$UseAskPassword = $true,
+    [bool]$AskPasswordOnce = $true,
     [string]$Password = "",
     [bool]$ShowServerResponse = $true,
     [bool]$KeepWorkDir = $true
@@ -275,6 +276,7 @@ Write-Host ("wget.exe         : {0}" -f $wgetExe)
 Write-Host ("Cookie jar       : {0}" -f $cookieJar)
 Write-Host ("RetryCount       : {0}" -f $RetryCount)
 Write-Host ("UseAskPassword   : {0}" -f $UseAskPassword)
+Write-Host ("AskPasswordOnce  : {0}" -f $AskPasswordOnce)
 Write-Host ("ShowServerResp   : {0}" -f $ShowServerResponse)
 Write-Host ("KeepWorkDir      : {0}" -f $KeepWorkDir)
 Write-Host ("Download log     : {0}" -f $downloadLog)
@@ -282,6 +284,63 @@ Write-Host ("Failed log       : {0}" -f $failedLog)
 Write-Host ""
 
 Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message ("RUN_START topics={0}" -f $topics.Count)
+
+$cookieAuthReady = $false
+if ($UseAskPassword -and $AskPasswordOnce) {
+    # Ask once to establish an authenticated cookie session.
+    $warmupTopic = $null
+    foreach ($line in $topics) {
+        $parsed = Parse-TopicEntry -Entry $line -DefaultWeb $DefaultWeb
+        if ($null -ne $parsed) {
+            $warmupTopic = $parsed
+            break
+        }
+    }
+    if ($null -eq $warmupTopic) {
+        $warmupTopic = [pscustomobject]@{
+            WebPath = $DefaultWeb
+            TopicName = "WebHome"
+        }
+    }
+
+    $warmupWeb = Encode-WebPath -WebPath $warmupTopic.WebPath
+    $warmupTopicName = [System.Uri]::EscapeDataString($warmupTopic.TopicName)
+    $warmupUrl = "{0}/{1}/{2}{3}" -f $base, $warmupWeb, $warmupTopicName, $query
+    $warmupOut = Join-Path -Path $tmpRoot -ChildPath "_auth_warmup.html"
+    Remove-IfExists -Path $warmupOut
+
+    Write-Host "Authentication warm-up (one password prompt)..."
+
+    $warmupArgs = @(
+        "--user=$Username",
+        "--ask-password",
+        "--content-disposition",
+        "--trust-server-names",
+        "--max-redirect=10",
+        "--auth-no-challenge",
+        "--keep-session-cookies",
+        "--save-cookies=$cookieJar",
+        "--load-cookies=$cookieJar",
+        "--output-document=$warmupOut"
+    )
+    if ($ShowServerResponse) {
+        $warmupArgs += "--server-response"
+    }
+    $warmupArgs += $warmupUrl
+
+    $warmupResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $warmupArgs -Interactive
+    if (($warmupResult.ExitCode -eq 0) -and (Test-Path -LiteralPath $warmupOut) -and ((Get-Item -LiteralPath $warmupOut).Length -gt 0)) {
+        $cookieAuthReady = $true
+        Write-Host "Authentication warm-up successful; reusing session cookies."
+        Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message "Auth warm-up succeeded; cookie reuse enabled." -Url $warmupUrl
+    }
+    else {
+        $msg = ("Auth warm-up failed (exit {0}). Falling back to prompt per topic." -f $warmupResult.ExitCode)
+        Write-Warning $msg
+        Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic "-" -Message $msg -Url $warmupUrl
+    }
+    Remove-IfExists -Path $warmupOut
+}
 
 $ok = 0
 $skipped = 0
@@ -341,8 +400,15 @@ foreach ($entry in $topics) {
             "--no-host-directories",
             "--directory-prefix=$workDir"
         )
+        $interactivePrompt = $false
         if ($UseAskPassword) {
-            $wgetArgs += "--ask-password"
+            if ($AskPasswordOnce -and $cookieAuthReady) {
+                # Cookie-auth mode: no repeated password prompts.
+            }
+            else {
+                $wgetArgs += "--ask-password"
+                $interactivePrompt = $true
+            }
         }
         else {
             $wgetArgs += "--password=$Password"
@@ -352,7 +418,7 @@ foreach ($entry in $topics) {
         }
         $wgetArgs += $topicUrl
 
-        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs -Interactive:$UseAskPassword
+        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs -Interactive:$interactivePrompt
         if ($wgetResult.ExitCode -ne 0) {
             $lastError = ("wget exit code {0}: {1}" -f $wgetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $wgetResult.Output))))
         }
