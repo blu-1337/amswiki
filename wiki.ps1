@@ -152,14 +152,23 @@ function Write-RunLog {
 function Invoke-WgetCommand {
     param(
         [Parameter(Mandatory = $true)][string]$Executable,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [switch]$Interactive
     )
 
     $oldEap = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = & $Executable @Arguments 2>&1
-        $exitCode = $LASTEXITCODE
+        if ($Interactive) {
+            # Keep wget attached to console so --ask-password prompt is visible.
+            & $Executable @Arguments
+            $exitCode = $LASTEXITCODE
+            $output = @()
+        }
+        else {
+            $output = & $Executable @Arguments 2>&1
+            $exitCode = $LASTEXITCODE
+        }
     }
     finally {
         $ErrorActionPreference = $oldEap
@@ -343,7 +352,7 @@ foreach ($entry in $topics) {
         }
         $wgetArgs += $topicUrl
 
-        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs
+        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs -Interactive:$UseAskPassword
         if ($wgetResult.ExitCode -ne 0) {
             $lastError = ("wget exit code {0}: {1}" -f $wgetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $wgetResult.Output))))
         }
