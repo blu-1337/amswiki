@@ -7,20 +7,19 @@ param(
     [string]$TopicsFile = "topics.txt",
     [string]$OutputDir = "wiki_output",
     [string]$HtmlQueryString = "skin=plain;template=viewplain",
-    [string]$WkhtmltopdfPath = "wkhtmltox/bin/wkhtmltopdf.exe",
     [int]$RetryCount = 1,
     [switch]$Overwrite,
-    [switch]$KeepHtml,
     [switch]$SkipPlaceholderCheck,
-    [switch]$SkipAssetMirror,
     [switch]$ShowServerResponse,
-    [switch]$NoSessionWarmup
+    [switch]$NoSessionWarmup,
+    [switch]$DownloadAssets,
+    [switch]$KeepWorkDir
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# PowerShell 7: native stderr can become non-terminating errors depending on preference.
+# PowerShell 7: avoid stderr from native tools becoming terminating errors.
 $nativeErrPrefVar = Get-Variable -Name "PSNativeCommandUseErrorActionPreference" -ErrorAction SilentlyContinue
 if ($null -ne $nativeErrPrefVar) {
     $PSNativeCommandUseErrorActionPreference = $false
@@ -86,7 +85,7 @@ function Parse-TopicEntry {
     }
 
     return [pscustomobject]@{
-        WebPath = $webPath
+        WebPath   = $webPath
         TopicName = $topicName
     }
 }
@@ -96,118 +95,36 @@ function Encode-WebPath {
     return (($WebPath -split "/") | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join "/"
 }
 
-function Test-PdfSignature {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $false
-    }
-
-    $bytes = New-Object byte[] 5
-    $stream = [System.IO.File]::OpenRead($Path)
-    try {
-        $read = $stream.Read($bytes, 0, $bytes.Length)
-    }
-    finally {
-        $stream.Dispose()
-    }
-
-    if ($read -lt 5) {
-        return $false
-    }
-
-    return ([System.Text.Encoding]::ASCII.GetString($bytes, 0, 5) -eq "%PDF-")
-}
-
 function Test-IsPlaceholderText {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if ($SkipPlaceholderCheck) {
-        return $false
-    }
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $false
-    }
-
-    $maxBytes = 2097152
-    $buffer = New-Object byte[] $maxBytes
-    $stream = [System.IO.File]::OpenRead($Path)
-    try {
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-    }
-    finally {
-        $stream.Dispose()
-    }
-
-    if ($read -le 0) {
-        return $false
-    }
-
-    $text = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
-    return ($text -like "*WikiGuest*" -and $text -like "*Topic revision: 1970-01-01*")
-}
-
-function Test-IsPlaceholderPdf {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if ($SkipPlaceholderCheck) {
-        return $false
-    }
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $false
-    }
-
-    $maxBytes = 2097152
-    $buffer = New-Object byte[] $maxBytes
-    $stream = [System.IO.File]::OpenRead($Path)
-    try {
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-    }
-    finally {
-        $stream.Dispose()
-    }
-
-    if ($read -le 0) {
-        return $false
-    }
-
-    $text = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
-    return ($text -like "*WikiGuest*" -and $text -like "*Topic revision: 1970-01-01*")
-}
-
-function Get-PreferredHtmlForConversion {
     param(
-        [Parameter(Mandatory = $true)][string]$SearchRoot,
-        [Parameter(Mandatory = $true)][string]$TopicName,
-        [Parameter(Mandatory = $true)][string]$FallbackHtmlPath
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$SkipCheck
     )
 
-    if (-not (Test-Path -LiteralPath $SearchRoot)) {
-        return $FallbackHtmlPath
+    if ($SkipCheck) {
+        return $false
     }
 
-    $htmlFiles = @(
-        Get-ChildItem -LiteralPath $SearchRoot -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in @(".html", ".htm") }
-    )
-
-    if ($htmlFiles.Count -eq 0) {
-        return $FallbackHtmlPath
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
     }
 
-    $topicRegex = [Regex]::Escape($TopicName)
-    $preferred = @(
-        $htmlFiles |
-            Where-Object { $_.Name -match $topicRegex -or $_.FullName -match $topicRegex }
-    )
-
-    if ($preferred.Count -eq 0) {
-        $preferred = $htmlFiles
+    $maxBytes = 2097152
+    $buffer = New-Object byte[] $maxBytes
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+    }
+    finally {
+        $stream.Dispose()
     }
 
-    return ($preferred | Sort-Object -Property Length -Descending | Select-Object -First 1).FullName
+    if ($read -le 0) {
+        return $false
+    }
+
+    $text = [System.Text.Encoding]::GetEncoding(28591).GetString($buffer, 0, $read)
+    return ($text -like "*WikiGuest*" -and $text -like "*Topic revision: 1970-01-01*")
 }
 
 function Shorten-Message {
@@ -259,8 +176,37 @@ function Invoke-WgetCommand {
 
     return [pscustomobject]@{
         ExitCode = $exitCode
-        Output = $output
+        Output   = $output
     }
+}
+
+function Get-PreferredHtmlFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$SearchRoot,
+        [Parameter(Mandatory = $true)][string]$TopicName,
+        [Parameter(Mandatory = $true)][string]$FallbackHtmlPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SearchRoot)) {
+        return $FallbackHtmlPath
+    }
+
+    $htmlFiles = @(
+        Get-ChildItem -LiteralPath $SearchRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in @(".html", ".htm") }
+    )
+
+    if ($htmlFiles.Count -eq 0) {
+        return $FallbackHtmlPath
+    }
+
+    $topicRegex = [Regex]::Escape($TopicName)
+    $preferred = @($htmlFiles | Where-Object { $_.Name -match $topicRegex -or $_.FullName -match $topicRegex })
+    if ($preferred.Count -eq 0) {
+        $preferred = $htmlFiles
+    }
+
+    return ($preferred | Sort-Object -Property Length -Descending | Select-Object -First 1).FullName
 }
 
 $scriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { (Get-Location).ProviderPath } else { $PSScriptRoot }
@@ -280,11 +226,6 @@ if ([string]::IsNullOrWhiteSpace($Username)) {
 $wgetExe = Join-Path -Path $scriptDir -ChildPath "wget.exe"
 if (-not (Test-Path -LiteralPath $wgetExe)) {
     throw ("wget.exe was not found next to wiki.ps1. Expected: {0}" -f $wgetExe)
-}
-
-$wkhtmlExe = Resolve-AbsolutePath -Path $WkhtmltopdfPath -BasePath $scriptDir
-if (-not (Test-Path -LiteralPath $wkhtmlExe)) {
-    throw ("wkhtmltopdf.exe was not found. Expected: {0}" -f $wkhtmlExe)
 }
 
 if (-not (Test-Path -LiteralPath $topicsPath)) {
@@ -321,36 +262,34 @@ if ([string]::IsNullOrWhiteSpace($password)) {
     throw "Empty password entered."
 }
 
-Write-Host "Starting HTML -> PDF wiki export..."
+Write-Host "Starting HTML wiki export..."
 Write-Host ("Username      : {0}" -f $Username)
 Write-Host ("Default web   : {0}" -f $DefaultWeb)
 Write-Host ("Base viewauth : {0}" -f $base)
 Write-Host ("Topics file   : {0}" -f $topicsPath)
 Write-Host ("Output dir    : {0}" -f $outputPath)
 Write-Host ("wget.exe      : {0}" -f $wgetExe)
-Write-Host ("wkhtmltopdf   : {0}" -f $wkhtmlExe)
 Write-Host ("Cookie jar    : {0}" -f $cookieJar)
 Write-Host ("RetryCount    : {0}" -f $RetryCount)
-if ($SkipAssetMirror) {
-    Write-Host "Asset mirror  : OFF (faster)"
+if ($DownloadAssets) {
+    Write-Host "Download assets: ON"
 }
 else {
-    Write-Host "Asset mirror  : ON"
+    Write-Host "Download assets: OFF (faster)"
 }
 if ($NoSessionWarmup) {
-    Write-Host "Session warmup: OFF"
+    Write-Host "Session warmup : OFF"
 }
 else {
-    Write-Host "Session warmup: ON"
+    Write-Host "Session warmup : ON"
 }
-Write-Host ("Download log  : {0}" -f $downloadLog)
-Write-Host ("Failed log    : {0}" -f $failedLog)
+Write-Host ("Download log   : {0}" -f $downloadLog)
+Write-Host ("Failed log     : {0}" -f $failedLog)
 Write-Host ""
 
 Write-RunLog -LogFile $downloadLog -Level "INFO" -Topic "-" -Message ("RUN_START topics={0}" -f $topics.Count)
 
 $warmupTopicUrl = "{0}/{1}/WebHome{2}" -f $base, (Encode-WebPath -WebPath $DefaultWeb), $query
-
 if (-not $NoSessionWarmup) {
     $warmupHtml = Join-Path -Path $tmpRoot -ChildPath "_warmup.html"
     Remove-IfExists -Path $warmupHtml
@@ -397,24 +336,24 @@ foreach ($entry in $topics) {
     }
 
     $safeName = ($entry -replace "[\\/:*?`"<>|]", "_")
-    $pdfPath = Join-Path -Path $outputPath -ChildPath ($safeName + ".pdf")
+    $finalHtmlPath = Join-Path -Path $outputPath -ChildPath ($safeName + ".html")
     $workDir = Join-Path -Path $tmpRoot -ChildPath $safeName
-    $htmlPath = Join-Path -Path $workDir -ChildPath "page.html"
+    $mainHtmlPath = Join-Path -Path $workDir -ChildPath "page.html"
     $assetsRoot = Join-Path -Path $workDir -ChildPath "assets"
 
     $encodedWeb = Encode-WebPath -WebPath $topic.WebPath
     $encodedTopic = [System.Uri]::EscapeDataString($topic.TopicName)
     $topicUrl = "{0}/{1}/{2}{3}" -f $base, $encodedWeb, $encodedTopic, $query
 
-    if ((-not $Overwrite) -and (Test-Path -LiteralPath $pdfPath)) {
-        $size = (Get-Item -LiteralPath $pdfPath).Length
-        if (($size -gt 0) -and (Test-PdfSignature -Path $pdfPath) -and (-not (Test-IsPlaceholderPdf -Path $pdfPath))) {
+    if ((-not $Overwrite) -and (Test-Path -LiteralPath $finalHtmlPath)) {
+        $size = (Get-Item -LiteralPath $finalHtmlPath).Length
+        if (($size -gt 0) -and (-not (Test-IsPlaceholderText -Path $finalHtmlPath -SkipCheck:$SkipPlaceholderCheck))) {
             Write-Host ("Skipping {0} (already downloaded)" -f $entry)
             Write-RunLog -LogFile $downloadLog -Level "SKIP" -Topic $entry -Message ("Already exists ({0} bytes)." -f $size) -Url $topicUrl
             $skipped++
             continue
         }
-        Remove-IfExists -Path $pdfPath
+        Remove-IfExists -Path $finalHtmlPath
     }
 
     $done = $false
@@ -423,11 +362,11 @@ foreach ($entry in $topics) {
     for ($attempt = 1; $attempt -le ($RetryCount + 1) -and -not $done; $attempt++) {
         Remove-IfExists -Path $workDir
         New-Item -ItemType Directory -Path $workDir | Out-Null
-        Remove-IfExists -Path $pdfPath
+        Remove-IfExists -Path $finalHtmlPath
 
         Write-Host ("[{0}/{1}] Downloading HTML for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
 
-        $wgetArgs = @(
+        $mainArgs = @(
             "--user=$Username",
             "--password=$password",
             "--content-disposition",
@@ -436,36 +375,33 @@ foreach ($entry in $topics) {
             "--auth-no-challenge",
             "--keep-session-cookies",
             "--save-cookies=$cookieJar",
-            "--output-document=$htmlPath",
+            "--output-document=$mainHtmlPath",
             $topicUrl
         )
         if (Test-Path -LiteralPath $cookieJar) {
-            $wgetArgs += "--load-cookies=$cookieJar"
+            $mainArgs += "--load-cookies=$cookieJar"
         }
         if ($ShowServerResponse) {
-            $wgetArgs += "--server-response"
+            $mainArgs += "--server-response"
         }
 
-        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs
-        $wgetOutput = $wgetResult.Output
-        $wgetExit = $wgetResult.ExitCode
-
-        if ($wgetExit -ne 0) {
-            $lastError = ("wget exit code {0}: {1}" -f $wgetExit, (Shorten-Message -Text ([string]::Join(" ", $wgetOutput))))
+        $mainResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $mainArgs
+        if ($mainResult.ExitCode -ne 0) {
+            $lastError = ("wget exit code {0}: {1}" -f $mainResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $mainResult.Output))))
         }
-        elseif (-not (Test-Path -LiteralPath $htmlPath)) {
+        elseif (-not (Test-Path -LiteralPath $mainHtmlPath)) {
             $lastError = "HTML file was not created."
         }
-        elseif ((Get-Item -LiteralPath $htmlPath).Length -eq 0) {
+        elseif ((Get-Item -LiteralPath $mainHtmlPath).Length -eq 0) {
             $lastError = "HTML file is empty."
         }
-        elseif (Test-IsPlaceholderText -Path $htmlPath) {
+        elseif (Test-IsPlaceholderText -Path $mainHtmlPath -SkipCheck:$SkipPlaceholderCheck) {
             $lastError = "Downloaded HTML appears to be guest/placeholder content."
         }
         else {
-            $htmlForPdf = $htmlPath
-            if (-not $SkipAssetMirror) {
-                # Second pass: fetch page requisites and rewrite links for reliable local rendering.
+            $htmlToKeep = $mainHtmlPath
+
+            if ($DownloadAssets) {
                 $assetArgs = @(
                     "--user=$Username",
                     "--password=$password",
@@ -491,68 +427,47 @@ foreach ($entry in $topics) {
 
                 $assetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $assetArgs
                 if ($assetResult.ExitCode -ne 0) {
-                    $assetError = ("Asset fetch warning (exit {0}): {1}" -f $assetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $assetResult.Output))))
-                    Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message $assetError -Url $topicUrl
+                    $assetMsg = ("Asset fetch warning (exit {0}): {1}" -f $assetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $assetResult.Output))))
+                    Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message $assetMsg -Url $topicUrl
                 }
 
-                $htmlForPdf = Get-PreferredHtmlForConversion -SearchRoot $assetsRoot -TopicName $topic.TopicName -FallbackHtmlPath $htmlPath
+                $htmlToKeep = Get-PreferredHtmlFile -SearchRoot $assetsRoot -TopicName $topic.TopicName -FallbackHtmlPath $mainHtmlPath
             }
 
-            Write-Host ("[{0}/{1}] Converting HTML to PDF for {2} ..." -f $attempt, ($RetryCount + 1), $entry)
-
-            $wkArgs = @(
-                "--enable-local-file-access",
-                "--load-error-handling", "ignore",
-                "--load-media-error-handling", "ignore",
-                $htmlForPdf,
-                $pdfPath
-            )
-
-            $oldEap2 = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                $wkOutput = & $wkhtmlExe @wkArgs 2>&1
-                $wkExit = $LASTEXITCODE
-            }
-            finally {
-                $ErrorActionPreference = $oldEap2
-            }
-
-            if ($wkExit -ne 0) {
-                $lastError = ("wkhtmltopdf exit code {0}: {1}" -f $wkExit, (Shorten-Message -Text ([string]::Join(" ", $wkOutput))))
-            }
-            elseif (-not (Test-Path -LiteralPath $pdfPath)) {
-                $lastError = "PDF file was not created."
-            }
-            elseif ((Get-Item -LiteralPath $pdfPath).Length -eq 0) {
-                $lastError = "PDF file is empty."
-            }
-            elseif (-not (Test-PdfSignature -Path $pdfPath)) {
-                $lastError = "Generated file is not a valid PDF."
-            }
-            elseif (Test-IsPlaceholderPdf -Path $pdfPath) {
-                $lastError = "Generated PDF contains guest/placeholder content."
+            if (-not (Test-Path -LiteralPath $htmlToKeep)) {
+                $lastError = "Final HTML source file is missing."
             }
             else {
-                $done = $true
-                $size = (Get-Item -LiteralPath $pdfPath).Length
-                Write-Host ("Saved PDF: {0}" -f $pdfPath)
-                Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $entry -Message ("Saved ({0} bytes)." -f $size) -Url $topicUrl
-                $ok++
+                Copy-Item -LiteralPath $htmlToKeep -Destination $finalHtmlPath -Force
+                if (-not (Test-Path -LiteralPath $finalHtmlPath)) {
+                    $lastError = "Failed to create final HTML file."
+                }
+                elseif ((Get-Item -LiteralPath $finalHtmlPath).Length -eq 0) {
+                    $lastError = "Final HTML file is empty."
+                }
+                elseif (Test-IsPlaceholderText -Path $finalHtmlPath -SkipCheck:$SkipPlaceholderCheck) {
+                    $lastError = "Final HTML contains guest/placeholder content."
+                }
+                else {
+                    $size = (Get-Item -LiteralPath $finalHtmlPath).Length
+                    Write-Host ("Saved HTML: {0}" -f $finalHtmlPath)
+                    Write-RunLog -LogFile $downloadLog -Level "OK" -Topic $entry -Message ("Saved ({0} bytes)." -f $size) -Url $topicUrl
+                    $ok++
+                    $done = $true
+                }
             }
         }
 
         if (-not $done) {
             Write-Warning ("Attempt {0} failed for {1}: {2}" -f $attempt, $entry, $lastError)
             Write-RunLog -LogFile $downloadLog -Level "WARN" -Topic $entry -Message ("Attempt {0}: {1}" -f $attempt, $lastError) -Url $topicUrl
-
             if ($attempt -lt ($RetryCount + 1)) {
                 Start-Sleep -Seconds ([Math]::Min(5, $attempt * 2))
             }
         }
     }
 
-    if (-not $KeepHtml) {
+    if (-not $KeepWorkDir) {
         Remove-IfExists -Path $workDir
     }
 
@@ -564,8 +479,7 @@ foreach ($entry in $topics) {
 }
 
 $password = $null
-if ((Test-Path -LiteralPath $tmpRoot) -and (-not $KeepHtml)) {
-    # Clean temp root if empty after successful cleanup.
+if ((Test-Path -LiteralPath $tmpRoot) -and (-not $KeepWorkDir)) {
     $leftovers = @(Get-ChildItem -LiteralPath $tmpRoot -Force -ErrorAction SilentlyContinue)
     if ($leftovers.Count -eq 0) {
         Remove-IfExists -Path $tmpRoot
