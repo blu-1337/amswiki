@@ -12,6 +12,7 @@ param(
     [switch]$SkipPlaceholderCheck,
     [bool]$UseAskPassword = $true,
     [bool]$AskPasswordOnce = $true,
+    [bool]$ExperimentalInjectAskPassword = $false,
     [string]$Password = "",
     [bool]$ShowServerResponse = $true,
     [bool]$KeepWorkDir = $true
@@ -154,13 +155,20 @@ function Invoke-WgetCommand {
     param(
         [Parameter(Mandatory = $true)][string]$Executable,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [switch]$Interactive
+        [switch]$Interactive,
+        [string]$InjectPassword
     )
 
     $oldEap = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        if ($Interactive) {
+        if (-not [string]::IsNullOrWhiteSpace($InjectPassword)) {
+            # Experimental mode: feed password to wget stdin while using --ask-password.
+            $stdin = $InjectPassword + [Environment]::NewLine
+            $output = $stdin | & $Executable @Arguments 2>&1
+            $exitCode = $LASTEXITCODE
+        }
+        elseif ($Interactive) {
             # Keep wget attached to console so --ask-password prompt is visible.
             & $Executable @Arguments
             $exitCode = $LASTEXITCODE
@@ -257,8 +265,21 @@ if ($topics.Count -eq 0) {
 }
 
 if (-not $UseAskPassword) {
+    if ($ExperimentalInjectAskPassword) {
+        Write-Warning "ExperimentalInjectAskPassword is ignored when UseAskPassword is false."
+    }
     if ([string]::IsNullOrWhiteSpace($Password)) {
         $securePassword = Read-Host ("Password for user {0}" -f $Username) -AsSecureString
+        $Password = Convert-SecureStringToPlainText -SecureString $securePassword
+    }
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        throw "Empty password entered."
+    }
+}
+elseif ($ExperimentalInjectAskPassword) {
+    # Prompt once and inject into each --ask-password call.
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        $securePassword = Read-Host ("Password for user {0} (experimental inject mode)" -f $Username) -AsSecureString
         $Password = Convert-SecureStringToPlainText -SecureString $securePassword
     }
     if ([string]::IsNullOrWhiteSpace($Password)) {
@@ -277,6 +298,10 @@ Write-Host ("Cookie jar       : {0}" -f $cookieJar)
 Write-Host ("RetryCount       : {0}" -f $RetryCount)
 Write-Host ("UseAskPassword   : {0}" -f $UseAskPassword)
 Write-Host ("AskPasswordOnce  : {0}" -f $AskPasswordOnce)
+Write-Host ("InjectAskPass    : {0}" -f $ExperimentalInjectAskPassword)
+if ($ExperimentalInjectAskPassword) {
+    Write-Host "WARNING: Experimental password injection mode is enabled."
+}
 Write-Host ("ShowServerResp   : {0}" -f $ShowServerResponse)
 Write-Host ("KeepWorkDir      : {0}" -f $KeepWorkDir)
 Write-Host ("Download log     : {0}" -f $downloadLog)
@@ -309,7 +334,12 @@ if ($UseAskPassword -and $AskPasswordOnce) {
     $warmupOut = Join-Path -Path $tmpRoot -ChildPath "_auth_warmup.html"
     Remove-IfExists -Path $warmupOut
 
-    Write-Host "Authentication warm-up (one password prompt)..."
+    if ($ExperimentalInjectAskPassword) {
+        Write-Host "Authentication warm-up (using injected password)..."
+    }
+    else {
+        Write-Host "Authentication warm-up (one password prompt)..."
+    }
 
     $warmupArgs = @(
         "--user=$Username",
@@ -328,7 +358,11 @@ if ($UseAskPassword -and $AskPasswordOnce) {
     }
     $warmupArgs += $warmupUrl
 
-    $warmupResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $warmupArgs -Interactive
+    $warmupInjectPassword = ""
+    if ($ExperimentalInjectAskPassword) {
+        $warmupInjectPassword = $Password
+    }
+    $warmupResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $warmupArgs -Interactive:(-not $ExperimentalInjectAskPassword) -InjectPassword $warmupInjectPassword
     if (($warmupResult.ExitCode -eq 0) -and (Test-Path -LiteralPath $warmupOut) -and ((Get-Item -LiteralPath $warmupOut).Length -gt 0)) {
         $cookieAuthReady = $true
         Write-Host "Authentication warm-up successful; reusing session cookies."
@@ -401,8 +435,13 @@ foreach ($entry in $topics) {
             "--directory-prefix=$workDir"
         )
         $interactivePrompt = $false
+        $injectPassword = ""
         if ($UseAskPassword) {
-            if ($AskPasswordOnce -and $cookieAuthReady) {
+            if ($ExperimentalInjectAskPassword) {
+                $wgetArgs += "--ask-password"
+                $injectPassword = $Password
+            }
+            elseif ($AskPasswordOnce -and $cookieAuthReady) {
                 # Cookie-auth mode: no repeated password prompts.
             }
             else {
@@ -418,7 +457,7 @@ foreach ($entry in $topics) {
         }
         $wgetArgs += $topicUrl
 
-        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs -Interactive:$interactivePrompt
+        $wgetResult = Invoke-WgetCommand -Executable $wgetExe -Arguments $wgetArgs -Interactive:$interactivePrompt -InjectPassword $injectPassword
         if ($wgetResult.ExitCode -ne 0) {
             $lastError = ("wget exit code {0}: {1}" -f $wgetResult.ExitCode, (Shorten-Message -Text ([string]::Join(" ", $wgetResult.Output))))
         }
