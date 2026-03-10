@@ -347,7 +347,6 @@ if ($UseAskPassword -and $AskPasswordOnce) {
         "--content-disposition",
         "--trust-server-names",
         "--max-redirect=10",
-        "--auth-no-challenge",
         "--keep-session-cookies",
         "--save-cookies=$cookieJar",
         "--load-cookies=$cookieJar",
@@ -423,10 +422,6 @@ foreach ($entry in $topics) {
             "--content-disposition",
             "--trust-server-names",
             "--max-redirect=10",
-            "--auth-no-challenge",
-            "--keep-session-cookies",
-            "--save-cookies=$cookieJar",
-            "--load-cookies=$cookieJar",
             "--page-requisites",
             "--convert-links",
             "--adjust-extension",
@@ -443,6 +438,9 @@ foreach ($entry in $topics) {
             }
             elseif ($AskPasswordOnce -and $cookieAuthReady) {
                 # Cookie-auth mode: no repeated password prompts.
+                $wgetArgs += "--keep-session-cookies"
+                $wgetArgs += "--save-cookies=$cookieJar"
+                $wgetArgs += "--load-cookies=$cookieJar"
             }
             else {
                 $wgetArgs += "--ask-password"
